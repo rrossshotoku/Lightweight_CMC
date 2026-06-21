@@ -1,0 +1,38 @@
+# --- Build output (CubeIDE / GCC) -------------------------------------------
+Debug/
+Release/
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.lst
+*.su
+
+# --- CubeIDE / Eclipse per-user state ---------------------------------------
+# .settings often contains user-specific paths; commit only if you have a
+# good reason to share them across the team.
+.settings/
+.metadata/
+.idea/
+.vscode/
+RemoteSystemsTempFiles/
+
+# --- CubeMX scratch ----------------------------------------------------------
+# Keep .ioc and .mxproject; ignore the per-IDE launch files that bake in
+# absolute paths if you find them noisy.
+# *.launch
+
+# --- Editor / OS noise -------------------------------------------------------
+*~
+*.bak
+*.swp
+*.swo
+Thumbs.db
+.DS_Store
+
+# --- Claude / agent scratch --------------------------------------------------
+tmpclaude-*-cwd/
+.claude/
