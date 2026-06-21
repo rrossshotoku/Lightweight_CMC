@@ -25,6 +25,14 @@ RemoteSystemsTempFiles/
 # absolute paths if you find them noisy.
 # *.launch
 
+# --- Python (Interface/gui/ tooling) ----------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
 # --- Editor / OS noise -------------------------------------------------------
 *~
 *.bak
