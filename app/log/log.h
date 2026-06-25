@@ -57,6 +57,7 @@ size_t log_peek   (uint8_t *out, size_t max);
 void   log_consume(size_t n);
 size_t log_drain  (uint8_t *out, size_t max);
 size_t log_dropped_lines(void);
+bool   log_tcp_client_connected(void);
 
 #ifdef __cplusplus
 }

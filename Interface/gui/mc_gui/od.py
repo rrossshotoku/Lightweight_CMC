@@ -41,6 +41,14 @@ _ACCESS_BY_NAME = {"MC_IF_A_RO": A_RO, "MC_IF_A_WO": A_WO, "MC_IF_A_RW": A_RW}
 F_NONE, F_PDO, F_PERSIST = 0x00, 0x01, 0x02
 _FLAG_BY_NAME = {"MC_IF_F_NONE": F_NONE, "MC_IF_F_PDO": F_PDO, "MC_IF_F_PERSIST": F_PERSIST}
 
+# --- entry owner (MC_IfOdOwner_t, added in protocol v2) ---------------------------
+# Which firmware actually handles reads/writes for the entry. Motor-owned entries
+# travel over SPI via the CMC's cia402 OD pipeline; CMC-owned entries (0x3xxx,
+# axis_manager) are handled locally on the CMC and never reach the motor MCU.
+OWNER_MOTOR, OWNER_CMC = 0, 1
+OWNER_NAME = {OWNER_MOTOR: "motor", OWNER_CMC: "CMC"}
+_OWNER_BY_NAME = {"MC_IF_OWNER_MOTOR": OWNER_MOTOR, "MC_IF_OWNER_CMC": OWNER_CMC}
+
 # Telemetry map object (0x2A00); 16 array sub-entries are U32 map words.
 TLM_MAP_INDEX = 0x2A00
 TLM_MAX_ENTRIES = 16
@@ -82,6 +90,7 @@ class OdEntry:
     scale: float = 1.0
     unit: str = ""
     synthetic: bool = False  # not literally in the X-macro (e.g. 0x2A00 array subs)
+    owner: int = OWNER_MOTOR  # MC_IfOdOwner_t (default preserves pre-v2 behaviour)
 
     @property
     def key(self) -> tuple[int, int]:
@@ -102,6 +111,10 @@ class OdEntry:
     @property
     def access_name(self) -> str:
         return ACCESS_NAME[self.access]
+
+    @property
+    def owner_name(self) -> str:
+        return OWNER_NAME.get(self.owner, "?")
 
     @property
     def size(self) -> int:
@@ -205,10 +218,14 @@ def find_header(start: Path | None = None) -> Path:
 
 
 _SCALE_RE = re.compile(r"#define\s+MC_IF_(\w+)_SCALE\s+\(?\s*([0-9.eE+-]+)f?\s*\)?")
-# X(0x1000, 0, device_type, MC_IF_T_U32, MC_IF_A_RO, MC_IF_F_NONE)
+# Protocol v2 X-macro shape (owner column is the 7th and final argument):
+#   X(0x1000, 0, device_type, MC_IF_T_U32, MC_IF_A_RO, MC_IF_F_NONE, MC_IF_OWNER_MOTOR)
+# The owner column is optional in the regex for backward compatibility with
+# pre-v2 headers (entries without it default to MC_IF_OWNER_MOTOR).
 _ENTRY_RE = re.compile(
     r"X\(\s*(0x[0-9A-Fa-f]+)\s*,\s*(\d+)\s*,\s*(\w+)\s*,\s*"
-    r"(MC_IF_T_\w+)\s*,\s*(MC_IF_A_\w+)\s*,\s*([^)]+)\)"
+    r"(MC_IF_T_\w+)\s*,\s*(MC_IF_A_\w+)\s*,\s*([A-Za-z0-9_|\s]+?)"
+    r"(?:\s*,\s*(MC_IF_OWNER_\w+))?\s*\)"
 )
 
 
@@ -242,6 +259,7 @@ def parse_od_header(path: Path | None = None) -> OdModel:
         type_code = _TYPE_BY_NAME[m.group(4)]
         access = _ACCESS_BY_NAME[m.group(5)]
         flags = _parse_flags(m.group(6))
+        owner = _OWNER_BY_NAME.get(m.group(7) or "MC_IF_OWNER_MOTOR", OWNER_MOTOR)
 
         quantity = _QUANTITY_BY_INDEX.get(index)
         if quantity and type_code != T_F32:
@@ -251,7 +269,8 @@ def parse_od_header(path: Path | None = None) -> OdModel:
             scale = 1.0
             unit = _infer_unit(name) if type_code == T_F32 else ""
 
-        entries.append(OdEntry(index, sub, name, type_code, access, flags, scale, unit))
+        entries.append(OdEntry(index, sub, name, type_code, access, flags,
+                               scale, unit, owner=owner))
         seen.add((index, sub))
 
     if not entries:

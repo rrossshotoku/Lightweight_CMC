@@ -29,7 +29,8 @@ typedef struct {
     uint16_t udp_poll_port;       /* CAMERAD poll, default 30002 */
     uint16_t tcp_camerad_port;    /* CAMERAD TCP listen, default 30003 */
     uint16_t http_port;           /* default 80 */
-    uint16_t od_udp_port;         /* SDO-over-UDP, default 30100 */
+    uint16_t od_udp_port;         /* OD access UDP, default 5000 per Interface/NETWORK_UDP_SPEC.md.
+                                   * Telemetry sits at od_udp_port + 1 (= 5001 by default). */
     uint16_t log_tcp_port;        /* log socket, default 30200 */
     uint32_t cmc_device_no;       /* this CMC's CAMERAD device number */
 } network_cfg_t;
@@ -65,6 +66,14 @@ bool                   config_set_auth_password(const char *new_password);
 
 uint8_t                config_get_node_id(void);
 bool                   config_set_node_id(uint8_t node_id);
+
+/* Persist the operator-tunable subset of the network config (IP, netmask,
+ * gateway, cmc_device_no) to flash via app/persist's NETWORK region.
+ * Returns true on success. Blocks for ~30 ms during flash erase/program.
+ * Called from app/web's /api/save handler. Other network fields (ports,
+ * MAC) are not persisted — ports are fixed wire conventions and MAC is
+ * derived from the STM32 UID at boot. */
+bool                   config_save_network_to_flash(void);
 
 #ifdef __cplusplus
 }

@@ -8,7 +8,11 @@ Source: WIZnet `ioLibrary_Driver` (Apache 2.0). The files here are the minimal s
 - `wizchip_conf.c`, `wizchip_conf.h` — chip selection (`_WIZCHIP_ = W6100`), CRIS / CS / SPI callback registration, network-info accessors.
 - `W6100/w6100.c`, `W6100/w6100.h` — W6100-specific register access via the registered SPI callbacks.
 
-`Internet/` and `Application/` from the upstream tree are not included — we don't use DHCP, DNS, HTTPClient, MQTT or the demo apps. If we ever need DHCP, add `Internet/DHCP/` here.
+`Internet/` from the upstream tree is not included — we don't use DHCP, DNS, HTTPClient, MQTT or the demo apps. If we ever need DHCP, add `Internet/DHCP/` here.
+
+### A note on `Drivers/Application/Application.h`
+
+`wizchip_conf.h` uses a hard-coded relative include `#include "../Application/Application.h"`. That header (19 lines of `SOCK_*` and `AS_*` macros) lives in a sibling folder per the upstream layout. To honour the relative path without editing vendor source, the file sits at **`Drivers/Application/Application.h`** — a sibling of this folder. It's vendor too; don't modify it. The sibling-`Application/` name looks odd next to `STM32G4xx_HAL_Driver/`, but moving it would require patching the vendor include — explicitly against the rule.
 
 ## Wiring this into the project
 

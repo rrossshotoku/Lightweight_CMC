@@ -28,7 +28,6 @@
 /* USER CODE BEGIN Includes */
 #include "app/main_loop/main_loop.h"
 #include "app/log/log.h"
-#include "bsp/wdg/wdg.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -107,7 +106,11 @@ int main(void)
   /* Initialize USER push-button, will be used to trigger an interrupt each time it's pressed.*/
   BSP_PB_Init(BUTTON_USER, BUTTON_MODE_EXTI);
 
+  /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  /* (Nucleo BSP LED/button init removed — this board defines its own
+   *  pins in the .ioc: DEBUG_LED on PB11, UP_BUTTON/DOWN_BUTTON on PB1/PB2.
+   *  Those pins are configured by MX_GPIO_Init from CubeMX; no BSP needed.) */
   main_loop_init();
   main_loop_run();          /* never returns */
 
@@ -178,11 +181,12 @@ void SystemClock_Config(void)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* Log if possible, then let the IWDG reset us. Do NOT disable interrupts
-   * here: if the IWDG is initialised it kicks via LSI regardless, but we
-   * want SysTick to keep ticking for any pending HAL work to complete. */
+  /* Log if possible, then spin. The watchdog is not enabled yet (see
+   * Documentation/architecture.md §7.1) so there is no automatic reset
+   * — manual power-cycle required if you land here. */
   LOG_ERROR("Error_Handler invoked");
-  wdg_force_reset();
+  __disable_irq();
+  while (1) { }
   /* USER CODE END Error_Handler_Debug */
 }
 #ifdef USE_FULL_ASSERT

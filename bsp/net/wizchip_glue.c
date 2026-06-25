@@ -31,12 +31,12 @@
 
 static void cs_select(void)
 {
-    HAL_GPIO_WritePin(W6100_CS_GPIO_Port, W6100_CS_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(WIZCHIP_CS_GPIO_Port, WIZCHIP_CS_Pin, GPIO_PIN_RESET);
 }
 
 static void cs_deselect(void)
 {
-    HAL_GPIO_WritePin(W6100_CS_GPIO_Port, W6100_CS_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(WIZCHIP_CS_GPIO_Port, WIZCHIP_CS_Pin, GPIO_PIN_SET);
 }
 
 /*----------------------------------------------------------------------------
@@ -68,18 +68,21 @@ static void spi_writebyte(uint8_t b)
     (void)HAL_SPI_TransmitReceive(&hspi2, &b, &rx, 1, SPI_TIMEOUT_MS);
 }
 
-static void spi_readburst(uint8_t *buf, uint16_t len)
+static void spi_readburst(uint8_t *buf, datasize_t len)
 {
     /* Drive 0xFF out while clocking bytes in. We could use HAL_SPI_Receive
      * (which drives whatever the MOSI line floats at), but explicit-0xFF
-     * matches the reference and avoids surprise behaviour on weird PHYs. */
+     * matches the reference and avoids surprise behaviour on weird PHYs.
+     *
+     * datasize_t is int16_t in the ioLibrary. We treat it as unsigned
+     * internally since lengths are never negative in practice. */
     static const uint8_t dummy[64] = {
         0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
         0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
         0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
         0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
     };
-    uint16_t remaining = len;
+    uint16_t remaining = (uint16_t)len;
     uint8_t  *p = buf;
     while (remaining > 0) {
         uint16_t chunk = (remaining < sizeof(dummy)) ? remaining : (uint16_t)sizeof(dummy);
@@ -89,10 +92,10 @@ static void spi_readburst(uint8_t *buf, uint16_t len)
     }
 }
 
-static void spi_writeburst(uint8_t *buf, uint16_t len)
+static void spi_writeburst(uint8_t *buf, datasize_t len)
 {
     /* HAL_SPI_Transmit ignores MISO. Adequate for register writes. */
-    (void)HAL_SPI_Transmit(&hspi2, buf, len, SPI_TIMEOUT_MS);
+    (void)HAL_SPI_Transmit(&hspi2, buf, (uint16_t)len, SPI_TIMEOUT_MS);
 }
 
 /*----------------------------------------------------------------------------
@@ -106,9 +109,9 @@ void wizchip_glue_reset_pulse(void)
 
     /* Active-low reset pulse. The W6100 datasheet specifies a minimum
      * 500 us reset pulse and ~150 ms internal startup. We give it more. */
-    HAL_GPIO_WritePin(W6100_RST_GPIO_Port, W6100_RST_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(WIZCHIP_RST_GPIO_Port, WIZCHIP_RST_Pin, GPIO_PIN_RESET);
     HAL_Delay(10);
-    HAL_GPIO_WritePin(W6100_RST_GPIO_Port, W6100_RST_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(WIZCHIP_RST_GPIO_Port, WIZCHIP_RST_Pin, GPIO_PIN_SET);
     HAL_Delay(150);
 }
 

@@ -17,7 +17,7 @@
  *  Byte order: little-endian. All multi-byte fields are LE; structs are packed.
  */
 
-#define MC_IF_PROTOCOL_VERSION (1u)
+#define MC_IF_PROTOCOL_VERSION (4u)  /* v4: cyclic header gained position_actual_scaled + movement_status (REQ-0013/ADR-033) */
 #define MC_IF_SYNC_WORD        (0xA55Au)
 
 /* --- SPI transport unit (fixed-size frame per SPI transaction; see spec) --- */
@@ -112,18 +112,36 @@ typedef struct __attribute__((packed))
 
 /* ===== Payloads ===== */
 
-/** @brief CYCLIC_CMD payload (master -> slave). Scaled per mc_if_od.h conventions. */
+/** @brief CYCLIC_CMD payload (master -> slave) -- streaming-only fields.
+ *
+ *  Protocol v3: the cyclic command carries ONLY what genuinely needs to stream
+ *  every cycle. All setup parameters (mode_of_operation, target_position,
+ *  target_torque, target_position_time_ms, profile_velocity,
+ *  profile_acceleration, profile_deceleration) travel via SDO over the SPI OD
+ *  pipeline and are stored on the motor MCU until a move is triggered.
+ *
+ *  Streaming fields:
+ *   - @c controlword carries the urgent / live bits: ENABLE, QUICK_STOP,
+ *     FAULT_RESET, HALT, and NEW_SETPOINT. NEW_SETPOINT (bit 4, CiA-402
+ *     standard) rising-edges trigger the motor MCU to execute the most
+ *     recently configured move.
+ *   - @c velocity_setpoint is the live velocity demand in scaled rad/s
+ *     (LSB = MC_IF_VEL_SCALE, same units as OD 0x60FF). Always present;
+ *     the motor MCU applies it as the active velocity target whenever in a
+ *     velocity-class mode (PROFILE_VELOCITY) and enabled. Steady value =
+ *     constant speed; varying value = jog / joystick. The cyclic value is
+ *     authoritative — `0x60FF target_velocity` (SDO) is informational only.
+ *   - @c command_counter is the LCMC's monotonic heartbeat; the motor MCU's
+ *     command-timeout dead-man fires if it stops advancing for more than
+ *     MC_IF_COMMAND_TIMEOUT_MS.
+ *
+ *  Total: 10 bytes of payload per cyclic transaction.
+ */
 typedef struct __attribute__((packed))
 {
-    uint16_t controlword;            /* OD 0x6040 */
-    int8_t   mode_of_operation;      /* OD 0x6060 */
-    int32_t  target_position;        /* OD 0x607A, pos LSB */
-    int32_t  target_velocity;        /* OD 0x60FF, vel LSB */
-    int32_t  target_torque_current;  /* OD 0x6071, current LSB */
-    uint32_t profile_velocity;       /* OD 0x6081 */
-    uint32_t profile_acceleration;   /* OD 0x6083 */
-    uint32_t profile_deceleration;   /* OD 0x6084 */
-    uint32_t command_counter;        /* increments each cycle; slave echoes/checks for timeout */
+    uint16_t controlword;            /* OD 0x6040 -- streaming bits only */
+    int32_t  velocity_setpoint;      /* live demand, ×MC_IF_VEL_SCALE rad/s */
+    uint32_t command_counter;        /* monotonic; slave dead-man */
 } MC_IfCyclicCommand_t;
 
 /** @brief CYCLIC_STATUS / telemetry frame HEADER (slave -> master), 12 bytes.
@@ -144,11 +162,20 @@ typedef struct __attribute__((packed))
     uint8_t  map_version;    /* increments on every telemetry-map change */
     uint8_t  map_byte_count; /* bytes of mapped blob following this header (0..MC_IF_TLM_BLOB_MAX) */
     uint32_t status_counter; /* echoes the last accepted command_counter */
+    int32_t  position_actual_scaled; /* v4: OD 0x6064, MC_IF_POS_SCALE (1e-5 rad/LSB) -- always present */
+    uint16_t movement_status;        /* v4: MC_IF_MOVE_* bits (REQ-0013 / ADR-033) */
     /* uint8_t mapped[map_byte_count];  -- telemetry blob, packed LE per the 0x2A00 map */
 } MC_IfCyclicStatusHeader_t;
 
-#define MC_IF_STATUS_HEADER_SIZE (12u)
-#define MC_IF_TLM_BLOB_MAX       (MC_IF_MAX_PAYLOAD - MC_IF_STATUS_HEADER_SIZE) /* 40 bytes */
+#define MC_IF_STATUS_HEADER_SIZE (18u)   /* v4 (was 12) -- MC_IF_TLM_BLOB_MAX recomputes 40 -> 34 */
+#define MC_IF_TLM_BLOB_MAX       (MC_IF_MAX_PAYLOAD - MC_IF_STATUS_HEADER_SIZE) /* 34 bytes */
+
+/* movement_status bits (cyclic header, v4; REQ-0013/ADR-033). 0x0004/0x0008 (setpoint accepted/
+ * complete, proposed in REQ-0013) and 0x0040..0x8000 are reserved. */
+#define MC_IF_MOVE_MOVING       (0x0001u)  /* axis in motion (drive enabled & |vel demand| or |vel meas| > ~0.01 rad/s) */
+#define MC_IF_MOVE_ON_TARGET    (0x0002u)  /* position-loop target reached (mirrors SW_TARGET_REACHED, motor-trajectory terms) */
+#define MC_IF_MOVE_AT_LIMIT_LO  (0x0010u)  /* soft min-position limit hit -- reserved, 0 until motor soft limits exist */
+#define MC_IF_MOVE_AT_LIMIT_HI  (0x0020u)  /* soft max-position limit hit -- reserved, 0 until motor soft limits exist */
 
 /** @brief OD_READ_REQ payload (master -> slave). */
 typedef struct __attribute__((packed))

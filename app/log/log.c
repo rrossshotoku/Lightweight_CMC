@@ -6,7 +6,8 @@
  * dropped-line counter that a future TCP layer can surface as a "[N dropped]"
  * marker.
  *
- * Line format: "[ms_ms] LVL message\n", e.g. "[001234] INFO  hello\n".
+ * Line format: "[HH:MM:SS.mmm] LVL  message\r\n",
+ *   e.g. "[00:00:01.234] INFO   hello\r\n".
  * No float support (nano-newlib doesn't link %f) — use integer scaling.
  */
 
@@ -18,7 +19,15 @@
 #include <stdio.h>
 #include <string.h>
 
-#define LOG_RING_BYTES     4096
+/* 8 KB ring (was 4 KB). Two reasons: (1) high-rate events like a fade
+ * trigger a tight burst of ~15 lines (RX KEYPRESS, cmc_state, SDO
+ * start/done x N, NEW_SETPOINT, state/op_mode/movement_status x several);
+ * if the TCP log client briefly disconnects, we want to retain the
+ * full event chain. (2) The recent "1100 lines dropped" episode showed
+ * the buffer overflowing when nobody was attached. STM32G431RB has
+ * 32 KB SRAM total — 8 KB for the log is comfortably 25%, still leaves
+ * plenty for everything else. */
+#define LOG_RING_BYTES     8192
 #define LOG_LINE_MAX       256
 
 /* Per the static W6100 socket map in Documentation/architecture.md §10.1.
@@ -206,8 +215,23 @@ void log_printf(log_level_t lvl, const char *fmt, ...)
     int      prefix_len;
     va_list  ap;
 
-    prefix_len = snprintf(buf, sizeof(buf), "[%06lu] %s ",
-                          (unsigned long)time_ms(), level_str(lvl));
+    /* Wall-clock-ish timestamp: HH:MM:SS.mmm since boot. Past 24 h the
+     * hour field just keeps counting (no day rollover) — still readable.
+     * Easier on the eye than a 6-digit millisecond count, and stays
+     * fixed-width as long as the device runs < ~46 days (then HH grows
+     * to 4 digits and column alignment drifts — acceptable). */
+    uint32_t ms_total = time_ms();
+    uint32_t ms       = ms_total % 1000u;
+    uint32_t s_total  = ms_total / 1000u;
+    uint32_t ss       = s_total % 60u;
+    uint32_t mm       = (s_total / 60u) % 60u;
+    uint32_t hh       = s_total / 3600u;
+
+    prefix_len = snprintf(buf, sizeof(buf),
+                          "[%02lu:%02lu:%02lu.%03lu] %s  ",
+                          (unsigned long)hh, (unsigned long)mm,
+                          (unsigned long)ss, (unsigned long)ms,
+                          level_str(lvl));
     if (prefix_len < 0 || (size_t)prefix_len >= sizeof(buf)) return;
 
     va_start(ap, fmt);
@@ -218,16 +242,20 @@ void log_printf(log_level_t lvl, const char *fmt, ...)
 
     size_t total = (size_t)prefix_len + (size_t)n;
     if (total >= sizeof(buf)) {
-        /* Truncated. Replace the final char with an ellipsis marker. */
-        total = sizeof(buf) - 1;
+        /* Truncated. Mark with ellipsis. Leave room for the CRLF below. */
+        total = sizeof(buf) - 2;
         buf[total - 3] = '.';
         buf[total - 2] = '.';
         buf[total - 1] = '.';
     }
-    if (buf[total - 1] != '\n') {
-        if (total < sizeof(buf)) buf[total++] = '\n';
-        else                     buf[sizeof(buf) - 1] = '\n';
-    }
+    /* Use CRLF so Windows terminals (telnet/PuTTY/nc) line-break properly.
+     * A bare \n leaves the cursor in the same column on the next line and
+     * makes everything stair-step across the screen. Strip any trailing
+     * \n the caller may have included so we don't double up. */
+    if (total > 0 && buf[total - 1] == '\n') total--;
+    if (total + 2 > sizeof(buf)) total = sizeof(buf) - 2;
+    buf[total++] = '\r';
+    buf[total++] = '\n';
 
     ring_write((const uint8_t *)buf, total);
 }
@@ -267,4 +295,5 @@ size_t log_drain(uint8_t *out, size_t max)
     return n;
 }
 
-size_t log_dropped_lines(void) { return s_dropped_lines; }
+size_t log_dropped_lines(void)       { return s_dropped_lines; }
+bool   log_tcp_client_connected(void) { return s_have_client; }

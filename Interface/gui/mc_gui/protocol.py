@@ -9,7 +9,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
-PROTOCOL_VERSION = 1  # MC_IF_PROTOCOL_VERSION
+PROTOCOL_VERSION = 4  # MC_IF_PROTOCOL_VERSION (v4: cyclic header + position_actual + movement_status; v3: cyclic-cmd reshape)
 UDP_MAGIC = 0x4D55  # 'MU'
 
 # Default ports (NETWORK_UDP_SPEC "Ports").
@@ -49,10 +49,10 @@ NODE_STATE_NAME = {
 _HEADER = struct.Struct("<HBBHH")  # magic, version, type, seq, length
 HEADER_SIZE = _HEADER.size  # 8
 
-# MC_IfCyclicStatusHeader_t: statusword, mode_display, node_state, error_code,
-# map_version, map_byte_count, status_counter  (12 bytes)
-_STATUS_HEADER = struct.Struct("<HbBHBBI")
-STATUS_HEADER_SIZE = _STATUS_HEADER.size  # 12
+# MC_IfCyclicStatusHeader_t (v4): statusword, mode_display, node_state, error_code,
+# map_version, map_byte_count, status_counter, position_actual_scaled, movement_status  (18 bytes)
+_STATUS_HEADER = struct.Struct("<HbBHBBIiH")
+STATUS_HEADER_SIZE = _STATUS_HEADER.size  # 18
 
 # MC_UdpTelemetryHeader_t: map_version, sample_count, record_bytes, reserved (4 bytes)
 _TLM_HEADER = struct.Struct("<BBBB")
@@ -160,6 +160,8 @@ class StatusHeader:
     map_version: int
     map_byte_count: int
     status_counter: int
+    position_actual_scaled: int = 0   # v4: OD 0x6064, 1e-5 rad/LSB (always present)
+    movement_status: int = 0          # v4: MC_IF_MOVE_* bits
 
 
 @dataclass

@@ -90,7 +90,7 @@ See `Documentation/architecture.md`. Hard rules in short:
 - `cmc_state` is the **single source of truth** for runtime state.
 - `camerad` and `cia402` are **stateless codecs** — pure byte transforms.
 - No `HAL_Delay`. No floats on the wire. No `while(1)` in error paths.
-- Watchdog on from day one.
+- Watchdog: deferred (will be re-added in Phase 6 hardening). Currently no automatic recovery from a main-loop hang — see `Documentation/architecture.md §7.1`.
 - Per-file soft cap ~400 lines, per-function ~100 lines.
 
 ## Status

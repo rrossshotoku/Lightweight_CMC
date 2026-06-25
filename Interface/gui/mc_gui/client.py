@@ -58,6 +58,7 @@ class NetworkClient(QObject):
         self._od_sock: socket.socket | None = None
         self._tlm_sock: socket.socket | None = None
         self._addr: tuple[str, int] | None = None
+        self._cmc_tlm_addr: tuple[str, int] | None = None
         self._cmd_q: "queue.Queue" = queue.Queue()
         self._cmd_thread: threading.Thread | None = None
         self._tlm_thread: threading.Thread | None = None
@@ -86,14 +87,28 @@ class NetworkClient(QObject):
             self.disconnect()
         try:
             self._addr = (ip, od_port)
+            # CMC convention: telemetry port = od_port + 1 (NETWORK_UDP_SPEC.md).
+            # We need to know this so we can "punch" the firewall — see
+            # _punch_telemetry_flow() below.
+            self._cmc_tlm_addr = (ip, od_port + 1)
+
             self._od_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._od_sock.bind(("", 0))  # ephemeral source port for OD req/resp
             self._tlm_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._tlm_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._tlm_sock.bind(("", tlm_port))
+            # The requested telemetry port may be in a Windows reserved/excluded range
+            # (Hyper-V/WSL/Docker) -> WinError 10013. Fall back to an ephemeral port;
+            # the CMC is told the actual rx port in TLM_SUBSCRIBE anyway.
+            try:
+                self._tlm_sock.bind(("", tlm_port))
+            except OSError as exc:
+                self.log_message.emit(
+                    f"Telemetry port {tlm_port} unavailable ({exc}); "
+                    f"using an ephemeral port instead.")
+                self._tlm_sock.bind(("", 0))
             self._tlm_port = self._tlm_sock.getsockname()[1]
         except OSError as exc:
-            self.log_message.emit(f"Connect failed: {exc}")
+            self.log_message.emit(f"Connect FAILED: {exc}")
             self._cleanup_sockets()
             self.connected_changed.emit(False)
             return
@@ -104,10 +119,37 @@ class NetworkClient(QObject):
         self._tlm_thread = threading.Thread(target=self._tlm_loop, name="tlm-rx", daemon=True)
         self._cmd_thread.start()
         self._tlm_thread.start()
+
+        # "Punch" the firewall: many host firewalls (incl. Windows Firewall)
+        # are stateful — they only allow inbound UDP that matches a flow the
+        # local socket has previously sent outbound from. Our telemetry
+        # receive socket would otherwise see no outbound traffic at all and
+        # its inbound datagrams would be dropped silently. Sending a 0-byte
+        # UDP from the receive socket to the CMC's telemetry port (5001 by
+        # default) registers the flow PC:tlm_port <-> CMC:cmc_tlm_port in
+        # the firewall's state table; subsequent inbound telemetry then
+        # matches and is allowed through. The CMC discards the empty
+        # datagram (it doesn't read from its telemetry socket for input).
+        self._punch_telemetry_flow()
+
         self.log_message.emit(
             f"Connected: OD -> {ip}:{od_port}, telemetry RX on local :{self._tlm_port}"
         )
         self.connected_changed.emit(True)
+
+    def _punch_telemetry_flow(self) -> None:
+        """Send a 0-byte UDP from the telemetry rx socket to the CMC's
+        telemetry port. Establishes a stateful-firewall flow entry so
+        subsequent inbound telemetry datagrams are accepted."""
+        try:
+            self._tlm_sock.sendto(b"", self._cmc_tlm_addr)
+        except OSError as exc:
+            # Non-fatal: if punching fails the user just needs a real
+            # firewall allow rule for the chosen port.
+            self.log_message.emit(
+                f"Telemetry firewall-punch send failed: {exc}. "
+                f"If you don't see telemetry datagrams, add an inbound UDP "
+                f"firewall rule for port {self._tlm_port}.")
 
     def disconnect(self) -> None:
         if not self._running:
@@ -330,6 +372,12 @@ class NetworkClient(QObject):
         return wr is not None and wr.result == proto.OD_OK
 
     def _do_subscribe(self, rate_divider: int, batch: int) -> None:
+        # Re-punch the firewall flow before subscribing — Windows ages out
+        # unused UDP "connection" entries after a few minutes, so if a user
+        # connected long before subscribing, the connect-time punch may
+        # have expired.
+        self._punch_telemetry_flow()
+
         seq = self._next_seq()
         req = proto.build_subscribe(seq, self._tlm_port, rate_divider, batch)
         # fire-and-forget (no response defined); send a few for reliability over UDP
@@ -393,6 +441,7 @@ class NetworkClient(QObject):
                 "node_state": float(sh.node_state),
                 "error_code": float(sh.error_code),
                 "status_counter": float(sh.status_counter),
+                "movement_status": float(sh.movement_status),   # v4 header (REQ-0013)
             }
             if layout_ok:
                 offset = 0

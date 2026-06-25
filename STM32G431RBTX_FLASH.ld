@@ -41,12 +41,41 @@ _estack = ORIGIN(RAM) + LENGTH(RAM); /* end of "RAM" Ram type memory */
 _Min_Heap_Size = 0x200; /* required amount of heap */
 _Min_Stack_Size = 0x400; /* required amount of stack */
 
-/* Memories definition */
+/* Memories definition
+ *
+ * The top 8 KB of flash (4 pages × 2 KB on STM32G431RB) are reserved
+ * for non-volatile storage via bsp/flash + app/persist:
+ *   pages 60-61 (0x0801E000-0x0801EFFF, 4 KB) — shots region (100 slots)
+ *   pages 62-63 (0x0801F000-0x0801FFFF, 4 KB) — config region
+ *
+ * These are declared as SEPARATE MEMORY regions (not just carved out of
+ * FLASH) so:
+ *   1. CubeIDE's Build Analyzer / Memory Details view shows them as
+ *      distinct named regions in the memory map.
+ *   2. The linker physically can't place .text/.rodata into them — any
+ *      stray code placement triggers a region-overflow link error
+ *      instead of silently overwriting persisted data on the next flash.
+ *   3. The reserved-bytes accounting in the build summary stays honest:
+ *      FLASH region shrinks to 120 KB so % full reflects the real code
+ *      budget. */
 MEMORY
 {
-  RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 32K
-  FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 128K
+  RAM            (xrw)   : ORIGIN = 0x20000000,   LENGTH = 32K
+  FLASH          (rx)    : ORIGIN = 0x08000000,   LENGTH = 120K
+  FLASH_SHOTS    (r)     : ORIGIN = 0x0801E000,   LENGTH =  4K
+  FLASH_CONFIG   (r)     : ORIGIN = 0x0801F000,   LENGTH =  4K
 }
+
+/* Persistent-storage base addresses — exported as symbols so bsp/flash
+ * and app/persist could optionally consume them via extern declarations
+ * (currently those modules hardcode the addresses in C; the symbols are
+ * here for the link map + any future runtime check). */
+_FLASH_PERSIST_BASE   = ORIGIN(FLASH_SHOTS);
+_FLASH_PERSIST_LENGTH = LENGTH(FLASH_SHOTS) + LENGTH(FLASH_CONFIG);
+_FLASH_SHOTS_BASE     = ORIGIN(FLASH_SHOTS);
+_FLASH_SHOTS_LENGTH   = LENGTH(FLASH_SHOTS);
+_FLASH_CONFIG_BASE    = ORIGIN(FLASH_CONFIG);
+_FLASH_CONFIG_LENGTH  = LENGTH(FLASH_CONFIG);
 
 /* Sections */
 SECTIONS

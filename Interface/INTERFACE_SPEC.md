@@ -73,6 +73,30 @@ Every transaction carries an independent framed message **each way**, each with 
 - A bad CRC/version frame is dropped (counts toward timeout) and an `ERROR` is staged; it never
   corrupts motion.
 
+## 3aa. Streaming vs SDO split (protocol v3)
+
+The cyclic command carries **only** what genuinely needs to stream every 1 ms:
+
+| Field | Type | Purpose |
+|---|---|---|
+| `controlword` | u16 | Urgent / live bits (ENABLE, QUICK_STOP, NEW_SETPOINT, FAULT_RESET, HALT) |
+| `velocity_setpoint` | i32 | Live velocity demand, scaled by `MC_IF_VEL_SCALE` (same units as 0x60FF). Applied when in a velocity mode and enabled |
+| `command_counter` | u32 | LCMC's monotonic heartbeat for the slave's command-timeout dead-man |
+
+Total: 10 bytes per cycle. Everything else — `mode_of_operation`, `target_position`, `target_torque`, `target_position_time_ms`, `profile_velocity` / `_acceleration` / `_deceleration` — is **SDO-only**, stored on the motor MCU between moves.
+
+**Setup-then-trigger** is the standard pattern for **position** moves:
+
+1. LCMC writes the relevant setup OD entries via SDO (`OD_WRITE_REQ` over the SPI OD pipeline).
+2. LCMC sets `controlword |= MC_IF_CW_NEW_SETPOINT` in the next cyclic command — rising edge triggers the motor MCU to latch the stored setup and execute.
+3. LCMC clears NEW_SETPOINT on subsequent cycles (so the next rising edge can re-arm).
+
+**Velocity** modes don't need a trigger. Once `mode_of_operation == MC_IF_MODE_PROFILE_VELOCITY` is set (via SDO) and the drive is enabled, the motor MCU follows the cyclic `velocity_setpoint` live every cycle. Steady value → constant speed; varying value → jog. The CMC's `axis_op_mode = JOYSTICK` is implemented entirely on the LCMC side — `axis_manager` computes `velocity_setpoint = joystick_value × joystick_max_velocity` locally; the motor MCU has no application-specific joystick concept.
+
+`0x60FF target_velocity` (SDO) is **informational only** in v3 — the cyclic `velocity_setpoint` is authoritative for velocity demand. Reads of 0x60FF return whatever the motor MCU last received (per its choice — cyclic or SDO), but the motor follows the cyclic stream.
+
+`quick_stop`, `fault_reset`, `halt` are always honoured live — they're carried in every cyclic, regardless of mode.
+
 ## 3a. Continuous motion commands (jog / joystick)
 
 Continuous, time-critical commands — **jog**, joystick velocity, streamed setpoints — ride the
@@ -107,7 +131,32 @@ it). Conventions:
   real floats). Ranges per spec 05: 0x2000 axis/motor, 0x2200 position, 0x2300 velocity,
   0x2400 current/FOC, 0x2500 encoder/estimator, 0x2600 faults/limits, 0x2700 calibration,
   0x2800 persistence, 0x2900 commissioning/test-injection.
+- **CMC-owned axis_manager objects** (`0x3xxx`, added in protocol v2): FLOAT32 SI for analog
+  values, U8 for modes / state / triggers. These back the network MCU's `axis_manager` and
+  are the universal command surface for protocol modules (CAMERAD, VISCA, PC tool). They are
+  handled locally on the network MCU and **never generate SPI traffic** — the motor MCU
+  does not own them and must skip them when building its OD table. Range layout:
+  `0x3000-0x300F` state (RO); `0x3010-0x301F` command triggers; `0x3020-0x302F` mode + targets
+  (joystick raw + cal at 0x3026-0x302A); `0x3030-0x303F` per-axis limits; `0x3040-0x304F`
+  dynamics (payload / future gain schedules); `0x3050-0x305F` persistence triggers (write
+  `MC_IF_SAVE_MAGIC` to commit the named region to the CMC's internal flash via
+  `app/persist`). `0x3100-0x31FF`, `0x3200-0x32FF` etc. are reserved for future axes 1, 2, …
 - Values in OD payloads are little-endian in `data[]`, length 1/2/4 by type.
+
+### Owner column (protocol v2)
+
+Every X(...) line in `MC_IF_OD_OBJECTS` now carries a trailing **owner** column —
+`MC_IfOdOwner_t` — which says which firmware is responsible for reads and writes:
+
+| Value | Meaning |
+|---|---|
+| `MC_IF_OWNER_MOTOR` | Motor MCU's OD table handles it. Reads/writes initiated by the network MCU travel over SPI via the cia402 OD pipeline. |
+| `MC_IF_OWNER_CMC`   | Network MCU's `app/od/cmc_od` handles it. No SPI traffic. |
+
+Both firmwares filter `MC_IF_OD_OBJECTS(X)` by owner when generating their local tables:
+the motor MCU builds entries where `owner == MC_IF_OWNER_MOTOR`; the network MCU builds
+entries where `owner == MC_IF_OWNER_CMC`. Host tools (PC GUI) iterate everything and
+display the owner alongside each entry.
 
 ### Tuning workflow this enables
 - **Read/write gains:** OD access to e.g. `0x2300:1` (vel_kp) as float32 — live, no reflash.
@@ -169,10 +218,41 @@ pushed telemetry stream (fire-and-forget, batched, carrying `map_version` + samp
 the PC detects drops and remaps). The telemetry map (0x2A00) is configured by the PC via OD
 writes bridged to the motor MCU — so "which signals to graph" is chosen end-to-end at runtime.
 
+For an OD request, the network MCU inspects the entry's owner: motor-owned entries are
+translated to SPI OD pipelining (as before); CMC-owned entries (`0x3xxx`, axis_manager) are
+handled locally and respond immediately, never reaching the motor MCU.
+
+## 5b. CMC-side: axis_manager and the protocol-module pattern
+
+The CMC's `app/axis_manager` owns motor command state at a high level — op-mode, targets,
+limits, axis state. **Its public API is the CMC-owned section of the OD** (`0x3xxx`). Every
+protocol module that drives the motor — CAMERAD, VISCA, the PC tool's OD writer, any future
+addition — does it the same way: write `axis_op_mode` to choose what's being commanded, write
+the per-mode targets (`axis_joystick_value`, `axis_target_velocity`, `axis_target_position` +
+`axis_target_time`), trigger `axis_enable`, `axis_quick_stop`, `axis_clear_fault` as needed,
+and read back state (`axis_state`, `axis_position_actual`, `axis_velocity_actual`,
+`axis_error_code`).
+
+Protocol modules MUST NOT bypass `axis_manager` by writing CiA-402 entries
+(`controlword 0x6040`, `target_velocity 0x60FF` etc.) directly. Those entries remain
+visible/writable for debug and tuning, but routing motor commands through them would
+desynchronise `axis_state` from reality and break arbitration between protocols.
+
+The network MCU's `axis_manager_tick` translates the OD state into the cyclic command sent
+to the motor MCU each ms — controlword, mode_of_operation, scaled targets. Single owner of
+the cyclic command frame.
+
 ## 6. Versioning
-`MC_IF_PROTOCOL_VERSION` covers both the framing and the OD layout. A frame whose `version`
-mismatches is rejected with `ERROR(MC_IF_ERR_BAD_VERSION)`. Add objects by appending to the
-X-macro and bumping the version.
+`MC_IF_PROTOCOL_VERSION` covers the framing and any **fixed** on-wire byte layout. A frame whose
+`version` mismatches is rejected with `ERROR(MC_IF_ERR_BAD_VERSION)`.
+
+**Appending a new OD object to the X-macro does NOT bump the version.** Acyclic `OD_READ`/`OD_WRITE`
+requests carry the index, subindex and type explicitly, and the cyclic telemetry frame has no fixed
+payload layout (§4 — the host configures `0x2A00`); so a new object adds no fixed wire layout. Older
+consumers simply never reference it, newer ones can. Bump `MC_IF_PROTOCOL_VERSION` only for changes to
+the wire itself: the frame/header format, the message-type set, or the size / meaning / scale of an
+existing field. Every change is still recorded in `CHANGELOG.md`, whose `3.x` minor versions track these
+additive, version-stable additions (e.g. `0x2200:4`, `0x2910:8`–`10`, added during bring-up).
 
 ## Operational defaults (committed)
 

@@ -185,8 +185,8 @@ No RTOS. The system is a cooperative super-loop driven by `main_loop`, which cal
 
 1. Dependencies flow **downward only**. A higher-layer module may include a lower-layer header; the reverse is forbidden.
 2. Layers, top to bottom:
-   1. `app/main_loop`
-   2. `app/controller_mgr`, `app/web`, `app/motor_ctrl`, `app/od`, `app/log`
+   1. `app/main_loop`, `app/debug`
+   2. `app/controller_mgr`, `app/web`, `app/axis_manager`, `app/od`, `app/log`
    3. `app/cmc_state`, `app/config`
    4. `app/camerad`, `app/cia402`
    5. `bsp/*`
@@ -194,8 +194,26 @@ No RTOS. The system is a cooperative super-loop driven by `main_loop`, which cal
 3. No file in `app/` includes anything from `Core/` or `Drivers/` directly. App code uses `bsp/` headers only.
 4. No file in `bsp/` includes anything from `app/`.
 5. `cmc_state` is the only module that holds runtime CMC state. Every other module reads/mutates via its API; no global fields are exposed.
-6. `camerad` and `cia402` are pure codecs: parse bytes → struct, build struct → bytes. They hold no state.
+6. `camerad` is a pure codec: parse bytes → struct, build struct → bytes. It holds no state. (`cia402` is no longer pure — it owns the SPI cyclic exchange state machine + OD pipeline.)
 7. **Soft file-size cap ~400 lines, function ~100 lines.** When a file approaches the limit, split before exceeding it.
+
+### 5a. axis_manager is the only command path to the motor
+
+The OD entries owned by the CMC (`0x3xxx` per `Interface/mc_if_od.h`, owner `MC_IF_OWNER_CMC`) are `axis_manager`'s public API. Three rules govern this:
+
+1. **Include-direction rule.** Protocol modules (`camerad`, `web`, future `visca`) may include `app/axis_manager/axis_manager.h` (or equivalently access the same data through the OD via `app/od/cmc_od.h`). They MAY NOT include `app/cia402/cia402.h`, `bsp/motor_spi/motor_spi.h`, or the motor-MCU OD entries from `Interface/mc_if_od.h` for command purposes. (Reading motor-MCU OD entries for tuning is fine; writing them as a motor-control path is not.)
+
+2. **Unit rule.** `axis_manager`'s public surface (the OD entries it backs and the C accessors that mirror them) speaks **SI units** — rad, rad/s, rad/s². Protocol modules convert their own dialect into SI before writing; `axis_manager` is responsible for scaling SI to/from the Interface wire units (`MC_IF_*_SCALE`) when issuing SDO writes to the motor MCU.
+
+3. **Single-owner rule.** Only `axis_manager` writes to `cia402`'s cyclic command state, and only `axis_manager` SDO-writes the motor-MCU OD entries that back motion commands (`0x6060`, `0x607A`, `0x607B`, `0x6081`, `0x6083`, `0x6084`). Protocol modules drive motion by writing the `0x3xxx` OD entries; the OD dispatch (`cmc_od`) calls down into `axis_manager`; `axis_manager` then translates into the appropriate cyclic streaming command and/or SDO writes. No other code path constructs cyclic commands or motor-MCU SDO motion writes.
+
+#### Streaming vs SDO command split (Interface protocol v3)
+
+`MC_IfCyclicCommand_t` carries only the **streaming-only** fields: `controlword` (live bits — ENABLE, QUICK_STOP, NEW_SETPOINT, FAULT_RESET, HALT), `velocity_setpoint` (live velocity demand, scaled rad/s — applied in any velocity mode), `command_counter` (dead-man heartbeat). Setup parameters (mode_of_operation, target_position, target_position_time_ms, target_torque, profile_velocity, profile_acceleration, profile_deceleration) are **SDO-only** — written to motor-MCU OD entries via the OD pipeline and stored there until a PROFILE_POSITION move is triggered by rising-edging `MC_IF_CW_NEW_SETPOINT` in the cyclic controlword. Velocity modes (PROFILE_VELOCITY, plus the CMC's `JOYSTICK` op-mode which maps to motor PROFILE_VELOCITY) don't need a trigger — the motor MCU follows the streaming `velocity_setpoint` live. The CMC's `axis_op_mode = JOYSTICK` is purely a CMC abstraction: `axis_manager` computes `velocity_setpoint = joystick_value × joystick_max_velocity` locally; the motor MCU has no joystick concept.
+
+The CMC's OD-over-UDP socket therefore serves **two** classes of traffic, both legitimate:
+- **Control** (`0x3xxx`, CMC-owned): goes through `cmc_od` → `axis_manager`. Every protocol module — including the PC tool's GUI writer — uses these entries the same way. No SPI traffic at the LCMC←→PC boundary; the LCMC may generate SPI SDO writes downstream as `axis_manager`'s setup-sequencer catches the motor MCU up.
+- **Tuning / diagnostics** (`0x1xxx`/`0x2xxx`/`0x6xxx`, motor-owned): goes through `cia402`'s SPI OD pipeline to the motor MCU. Existing path; unchanged. Protocols should not use this for motion commands — write `0x3xxx` instead so `axis_state` stays consistent and arbitration between protocols works.
 
 ---
 
@@ -206,9 +224,10 @@ No RTOS. The system is a cooperative super-loop driven by `main_loop`, which cal
 | L1 | `main_loop`      | `app/main_loop/`      | Init order; tick loop; watchdog kick | `app/main_loop/README.md` |
 | L2 | `controller_mgr` | `app/controller_mgr/` | UDP poll listen; per-controller TCP; dispatch | `app/controller_mgr/README.md` |
 | L2 | `web`            | `app/web/`            | HTTP/1.0 server; pages; JSON API; HTTP Basic auth | `app/web/README.md` |
-| L2 | `motor_ctrl`     | `app/motor_ctrl/`     | High-level motor API; trajectory generator | `app/motor_ctrl/README.md` |
-| L2 | `od`             | `app/od/`             | OD registry; dispatch; SDO-over-UDP network port | `app/od/README.md` |
+| L2 | `axis_manager`   | `app/axis_manager/`   | High-level axis command surface; data-model for CMC-owned OD (`0x3xxx`); single owner of the cyclic command | `app/axis_manager/README.md` |
+| L2 | `od`             | `app/od/`             | OD-over-UDP network bridge; owner-aware dispatch to `cmc_od` (CMC-local) or `cia402` (motor MCU) | `app/od/README.md` |
 | L2 | `log`            | `app/log/`            | RAM ring buffer; TCP log socket | `app/log/README.md` |
+| L1 | `debug`          | `app/debug/`          | Bringup diagnostic snapshot (`g_debug`) aggregated from every subsystem | `app/debug/README.md` |
 | L3 | `cmc_state`      | `app/cmc_state/`      | Selection, status bits, joystick profile, shot table | `app/cmc_state/README.md` |
 | L3 | `config`         | `app/config/`         | Versioned settings, motor limits, auth, node ID | `app/config/README.md` |
 | L4 | `camerad`        | `app/camerad/`        | CAMERAD wire codec (header + body) | `app/camerad/README.md` |
@@ -217,8 +236,8 @@ No RTOS. The system is a cooperative super-loop driven by `main_loop`, which cal
 | L5 | `bsp/motor_spi`  | `bsp/motor_spi/`      | Framed SPI transfer to motor MCU | `bsp/motor_spi/README.md` |
 | L5 | `bsp/flash`      | `bsp/flash/`          | Internal flash erase/program; dual-bank picker | `bsp/flash/README.md` |
 | L5 | `bsp/time`       | `bsp/time/`           | Monotonic ms tick | `bsp/time/README.md` |
-| L5 | `bsp/wdg`        | `bsp/wdg/`            | IWDG init + kick | `bsp/wdg/README.md` |
 | L5 | `bsp/identity`   | `bsp/identity/`       | Stable per-unit identity (MAC etc.); source-swappable | `bsp/identity/README.md` |
+| —  | ~~`bsp/wdg`~~    | (removed)             | Hardware watchdog — deferred; see §7.1 | — |
 | L6 | `Drivers/STM32G4xx_HAL_Driver` | `Drivers/` | CubeMX HAL — untouched | — |
 | L6 | `Drivers/BSP/STM32G4xx_Nucleo` | `Drivers/` | Nucleo BSP (LED, button) — untouched | — |
 | L6 | `Drivers/w6100`  | `Drivers/w6100/`      | WIZnet ioLibrary (vendor, dropped in for Phase 0b) | — |
@@ -227,13 +246,17 @@ No RTOS. The system is a cooperative super-loop driven by `main_loop`, which cal
 
 ## 7. Cross-cutting concerns
 
-### 7.1 Watchdog
+### 7.1 Watchdog (deferred — currently not enabled)
 
-- IWDG initialised in `main_loop_init`, before any other init runs.
-- Default timeout: **250 ms**.
-- `wdg_kick()` is called exactly once per `main_loop_run` pass, from `main_loop` itself. No other module may kick.
-- Debugger-freeze enabled (`__HAL_DBGMCU_FREEZE_IWDG`) so breakpoints do not cause spurious resets.
-- A `wdg_force_reset()` path exists for deliberate resets (e.g. from `Error_Handler` or a fatal protocol fault). It disables interrupts and busy-waits for IWDG expiry.
+The hardware Independent Watchdog (IWDG) is **not enabled** in the current build. It was part of the original Phase 0 skeleton (`bsp/wdg`) but has been removed pending a deliberate re-enable through the `.ioc` so the CubeMX-generated init and any application-layer kicker can share a single init path (otherwise we end up with two `HAL_IWDG_Init` calls that fight).
+
+Re-enable plan (Phase 6 hardening, or whenever fault-recovery becomes urgent):
+- Enable IWDG in the `.ioc` so `HAL_IWDG_MODULE_ENABLED` is set in `stm32g4xx_hal_conf.h` and `MX_IWDG_Init()` is generated.
+- Add `bsp/wdg/{wdg.c,wdg.h}` back with a `wdg_kick()` and `wdg_force_reset()`. Init either piggy-backs on CubeMX's `MX_IWDG_Init()` (recommended) or replaces it.
+- Wire `wdg_kick()` into the main_loop tick (sole caller).
+- Update `Error_Handler` in `Core/Src/main.c` to call `wdg_force_reset()` instead of spinning forever.
+
+Until then: a hung main loop, a hung TCP send, or `Error_Handler` being invoked leaves the device unresponsive until manual power-cycle.
 
 ### 7.2 Time
 
@@ -530,13 +553,13 @@ The wire format is defined by `Interface/NETWORK_UDP_SPEC.md`. **The summary bel
 
 | # | Goal | Modules touched | "Done" means | Status |
 |---|---|---|---|---|
-| 0a | Skeleton (no network) | `main_loop`, `bsp/time`, `bsp/wdg`, `log` (RAM), `config` (RAM) | Boots, LED toggles at 1 Hz, ring buffer fills, IWDG resets when starved | **DONE** |
+| 0a | Skeleton (no network) | `main_loop`, `bsp/time`, `log` (RAM), `config` (RAM) | Boots, LED toggles at 1 Hz, ring buffer fills | **DONE** |
 | 0b | W6100 + TCP log socket | `bsp/net`, `Drivers/w6100`, `log` (TCP) | `nc <ip> 30200` shows heartbeats and boot log | **DONE** (code; awaits hardware bring-up) |
 | 1  | UDP/TCP plumbing | `controller_mgr` (poll-listen + accept; dummy handlers) | A panel can poll and get *any* well-formed response | Not started |
 | 2  | CAMERAD codec + state | `camerad`, `cmc_state`, `controller_mgr` (full dispatch) | Real S- and T-panels can poll, select, deselect, send key presses; correct shapes returned | Not started |
 | 3  | Web + persistent config | `web`, `bsp/flash`, `config` (flash-backed) | Browse to device IP, log in, change settings, persists across reboot | Not started |
-| 4  | OD + cia402 + motor | `od`, `cia402`, `motor_ctrl`, `bsp/motor_spi` | Motor MCU is enabled via the `Interface/mc_if_protocol.h` cyclic exchange. Jog from a panel works end-to-end (panel → CMC → CYCLIC_CMD → motor). Soft limits respected. OD bridge handles arbitrary reads/writes pipelined onto the SPI cyclic. | Not started |
-| 5  | OD-over-UDP + telemetry stream | `od/od_net` | PC tool reads/writes OD entries on UDP 5000 (`MC_UdpHeader_t` + typed payload, bridged to motor MCU). TLM_SUBSCRIBE on UDP 5001 returns a live telemetry stream batched per `NETWORK_UDP_SPEC.md`. Map changes via OD writes to `0x2A00` are reflected end-to-end (PC observes new `map_version`). | Not started |
+| 4  | OD + cia402 + motor | `od`, `cia402`, `motor_ctrl`, `bsp/motor_spi` | Motor MCU is enabled via the `Interface/mc_if_protocol.h` cyclic exchange. Jog from a panel works end-to-end (panel → CMC → CYCLIC_CMD → motor). Soft limits respected. OD bridge handles arbitrary reads/writes pipelined onto the SPI cyclic. | **Codec + cyclic + OD pipeline DONE** (bsp/motor_spi, cia402 with CRC-16/Modbus, CYCLIC_CMD/STATUS, OD_READ/WRITE_REQ/RESP, ERROR handling). `motor_ctrl` (high-level API + trajectory) is the remaining piece — awaits a defined CMC↔panel motion API |
+| 5  | OD-over-UDP + telemetry stream | `od`, `cia402` | PC tool reads/writes OD entries on UDP 5000 (`MC_UdpHeader_t` + typed payload, bridged to motor MCU). TLM_SUBSCRIBE on UDP 5001 returns a live telemetry stream batched per `NETWORK_UDP_SPEC.md`. Map changes via OD writes to `0x2A00` are reflected end-to-end (PC observes new `map_version`). | **DONE** — OD bridge feeds real motor SPI now that cia402 is no longer a stub; telemetry stream feeds real samples from `cia402_take_cyclic_status` when the motor MCU produces them, falls back to 1 Hz keep-alive when it doesn't |
 | 6  | Hardening | All | Fault paths exercised (SPI fault → motor safe state; UDP packet loss; W6100 reset recovery). Soak test passes. Open points in `Interface/INTERFACE_SPEC.md` closed (scale factors, cyclic rate, SPI clock). | Not started |
 
 Status updates here are part of the maintenance rule: when a phase changes state, the row is updated in the same PR.
@@ -563,7 +586,7 @@ Status updates here are part of the maintenance rule: when a phase changes state
 | CANopen node ID | Configurable from web (default 1) |
 | Trajectory cadence | ~25 ms velocity setpoint stream during a fade |
 | OS / scheduling | Cooperative super-loop, no RTOS |
-| Watchdog timeout | 250 ms (IWDG) |
+| Watchdog | Deferred (Phase 6 hardening). Not enabled in current build — see §7.1 |
 | Per-file size cap | ~400 lines (soft) |
 
 ---

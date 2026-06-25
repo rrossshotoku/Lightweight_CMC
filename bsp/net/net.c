@@ -131,7 +131,7 @@ bool net_link_up(void)
  * Open / close
  *---------------------------------------------------------------------------*/
 
-bool net_open(net_sock_t sock, net_proto_t proto, uint16_t local_port, bool listen)
+bool net_open(net_sock_t sock, net_proto_t proto, uint16_t local_port, bool do_listen)
 {
     if (!s_initialised || !valid_sock(sock)) return false;
 
@@ -148,10 +148,10 @@ bool net_open(net_sock_t sock, net_proto_t proto, uint16_t local_port, bool list
         return false;
     }
 
-    if (proto == NET_PROTO_TCP && listen) {
-        /* socket.h declares `listen(uint8_t sn)` — this shadows POSIX listen
-         * but we're not linking against any POSIX networking, so the
-         * unqualified call resolves to the ioLibrary one. */
+    if (proto == NET_PROTO_TCP && do_listen) {
+        /* Parameter is named do_listen, not listen, deliberately — the
+         * WIZnet ioLibrary exposes a plain `listen(uint8_t sn)` in
+         * socket.h, and naming the local `listen` would shadow it. */
         rc = (int8_t)listen((uint8_t)sock);
         if (rc != SOCK_OK) {
             LOG_ERROR("net: listen(%d) failed rc=%d", (int)sock, (int)rc);
@@ -181,9 +181,41 @@ net_tcp_state_t net_tcp_state(net_sock_t sock)
 
 bool net_tcp_connect(net_sock_t sock, const net_addr_t *peer)
 {
-    (void)sock; (void)peer;
-    /* Phase 1 — outbound connect. Not used by Phase 0b. */
-    return false;
+    if (!s_initialised || !valid_sock(sock) || peer == NULL) return false;
+    if (peer->port == 0) return false;
+
+    /* Address must be non-zero and not broadcast. */
+    uint32_t taddr = ((uint32_t)peer->addr[0] << 24)
+                   | ((uint32_t)peer->addr[1] << 16)
+                   | ((uint32_t)peer->addr[2] <<  8)
+                   |  (uint32_t)peer->addr[3];
+    if (taddr == 0u || taddr == 0xFFFFFFFFu) return false;
+
+    uint8_t sn = (uint8_t)sock;
+
+    /* Socket must be in INIT state (i.e. opened as TCP, not yet
+     * connecting/listening). socket() left it in SOCK_INIT after a
+     * successful net_open(NET_PROTO_TCP, port, false). */
+    if (getSn_SR(sn) != SOCK_INIT) {
+        return false;
+    }
+
+    /* The WIZnet ioLibrary's connect() blocks until ESTABLISHED. We don't
+     * want that on a cooperative super-loop — instead, poke the registers
+     * directly and let the caller poll net_tcp_state(). The W6100 issues
+     * SYN as soon as Sn_CR_CONNECT is processed; the socket transitions
+     * INIT -> SYNSENT -> ESTABLISHED on its own. */
+    uint8_t addr_copy[4] = {peer->addr[0], peer->addr[1], peer->addr[2], peer->addr[3]};
+    setSn_DIPR  (sn, addr_copy);
+    setSn_DPORTR(sn, peer->port);
+    setSn_CR    (sn, Sn_CR_CONNECT);
+
+    /* Wait for the command register to clear (very fast — microseconds).
+     * After this, the SYN is on its way out; status will progress in the
+     * background. */
+    while (getSn_CR(sn)) { /* spin briefly */ }
+
+    return true;
 }
 
 bool net_tcp_reopen_listen(net_sock_t sock, uint16_t local_port)
@@ -225,13 +257,36 @@ int32_t net_recv(net_sock_t sock, uint8_t *buf, size_t maxlen)
 int32_t net_sendto(net_sock_t sock, const net_addr_t *peer,
                    const uint8_t *buf, size_t len)
 {
-    (void)sock; (void)peer; (void)buf; (void)len;
-    return -1;       /* Phase 1 */
+    if (!valid_sock(sock) || !peer || !buf || len == 0) return -1;
+
+    /* WIZnet's sendto takes a non-const addr pointer, so copy locally. */
+    uint8_t addr[4] = { peer->addr[0], peer->addr[1], peer->addr[2], peer->addr[3] };
+    int32_t rc = sendto((uint8_t)sock, (uint8_t *)buf, (uint16_t)len, addr, peer->port);
+    return rc;
 }
 
 int32_t net_recvfrom(net_sock_t sock, net_addr_t *peer,
                      uint8_t *buf, size_t maxlen)
 {
-    (void)sock; (void)peer; (void)buf; (void)maxlen;
-    return 0;        /* Phase 1 */
+    if (!valid_sock(sock) || !buf || maxlen == 0) return 0;
+
+    /* Non-blocking: only call recvfrom if there's actually data, otherwise
+     * the WIZnet recvfrom may busy-wait. UDP RSR is bytes available. */
+    uint16_t avail = getSn_RX_RSR((uint8_t)sock);
+    if (avail == 0) return 0;
+
+    /* WIZnet UDP frames carry an 8-byte header (peer addr + port + datalen)
+     * in the RX buffer in addition to the payload. recvfrom strips it and
+     * fills out peer addr+port for us. The payload returned is bounded by
+     * the smaller of caller's maxlen and one UDP datagram. */
+    uint8_t  raddr[4] = {0};
+    uint16_t rport    = 0;
+    uint16_t want     = (maxlen > UINT16_MAX) ? UINT16_MAX : (uint16_t)maxlen;
+    int32_t  n        = recvfrom((uint8_t)sock, buf, want, raddr, &rport);
+    if (n > 0 && peer) {
+        peer->addr[0] = raddr[0]; peer->addr[1] = raddr[1];
+        peer->addr[2] = raddr[2]; peer->addr[3] = raddr[3];
+        peer->port    = rport;
+    }
+    return n;
 }

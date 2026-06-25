@@ -18,14 +18,24 @@ This GUI ──UDP──► CMC (Lightweight_CMC) ──SPI──► Motor MCU (
   ints and float32 manufacturer objects are entered/shown in **SI units**;
   bitfields (controlword/statusword/error) accept and show hex. Writes are
   confirmed and read back.
+- **Motor Config tab** — set the motor controller's persistent configuration
+  (motor model, position/velocity/FOC gains, estimator, fault & motion-profile
+  limits, alignment params) from grouped SI-unit fields with per-field *Apply*,
+  and fire the OD-triggered commands — **electrical alignment**, **set mechanical
+  zero**, **current offset**, **save to flash**, **factory reset**. A
+  **completeness** line (from `cal_done_flags`, 0x2700:5) shows which calibrations
+  are still *outstanding*, plus live `cal_status` / `store_status` read-back.
+  (CMC-owned config has its own **CMC Setup** tab.)
 - **Configurable telemetry map (0x2A00)** — choose up to 16 PDO-mappable signals
   (≤ 40 bytes). *Apply* writes the map atomically (deactivate → list → activate),
   exactly as the spec requires.
 - **Real-time pop-out graphs** — one or more streaming windows. Pick channels,
   **left-drag to pan, scroll-wheel to zoom, right-drag to box-zoom**, **Pause** to
   freeze and inspect, **Auto-scroll** to follow the newest sample (auto-disengages
-  the moment you pan/zoom). Backed by a rolling buffer so plotting stays smooth
-  even at 1 kHz.
+  the moment you pan/zoom). **Add marker** drops draggable vertical time cursors —
+  drag two onto points of interest to read the time between them (Δt and frequency);
+  double-click a marker to remove it, **Clear markers** removes all. Backed by a
+  rolling buffer so plotting stays smooth even at 1 kHz.
 
 ## Install & run
 
@@ -71,3 +81,15 @@ If `mc_if_od.h` isn't auto-found, pass it explicitly:
   active map's size — a stale layout is shown header-only rather than as garbage.
 - OD access uses 50 ms timeout / 3 retransmits, matching the spec's reliability
   guidance; telemetry is fire-and-forget on a separate socket/thread.
+- **Firewall punch.** Stateful host firewalls (Windows Firewall in particular)
+  only allow inbound UDP that matches a flow the local socket has previously
+  sent outbound from. Our telemetry receive socket has nothing to send under
+  normal use, so its inbound datagrams would be silently dropped. The client
+  works around this by sending a 0-byte UDP from the receive socket to the
+  CMC's telemetry port (`od_port + 1`) at *connect* and again just before
+  *subscribe*. This registers the PC-tlm ↔ CMC-tlm flow in the firewall's
+  state table so subsequent telemetry datagrams are accepted. The CMC ignores
+  the empty datagrams (it drains the telemetry socket once per tick). If the
+  punch send itself fails (e.g. very restrictive egress policy), the log line
+  `Telemetry firewall-punch send failed` is emitted — fall back to adding an
+  explicit inbound UDP allow rule for your chosen telemetry port.

@@ -20,6 +20,10 @@ Host / PC tool
   OD conventions, **configurable runtime telemetry mapping**, side-effects, versioning, rationale.
 - `NETWORK_UDP_SPEC.md` — the network contract (PC ⟷ CMC): all-UDP OD access + telemetry stream
   that the network MCU exposes on Ethernet, mirroring the OD model.
+- `CHANGELOG.md` — wire-format / OD changes, with `MC_IF_PROTOCOL_VERSION` impact.
+- `REQUESTS.md` — cross-project request log. Items raised by one project for another to
+  implement. Process documentation, not wire contract — does **not** bump
+  `MC_IF_PROTOCOL_VERSION`. See the file for the entry template.
 
 ## How each side uses it
 - **Motor-control MCU (slave):** implements the OD from `MC_IF_OD_OBJECTS`, maps each entry to

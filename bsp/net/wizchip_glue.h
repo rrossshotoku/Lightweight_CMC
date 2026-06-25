@@ -15,28 +15,23 @@
 /*----------------------------------------------------------------------------
  * Pin assignment.
  *
- * Configure these in the CubeMX .ioc by giving the pins the labels
- * W6100_CS, W6100_RST and (optionally) W6100_INT. CubeMX then emits
- * matching macros in Core/Inc/main.h and the #ifndef guards below pick
- * them up. If you have not yet labelled the pins, edit the defaults
- * here as a temporary measure (and tell the user to fix the .ioc).
+ * The Lightweight_CMC.ioc labels the W6100 control pins as:
+ *   SPI2_NSS  (PB12)  — chip select
+ *   WIZ_RSTn  (PC8)   — active-low reset
+ *   WIZ_INT   (PC9)   — IRQ line (EXTI9, not used yet — polled mode)
  *
- * Defaults are inherited from the reference uc_camd_interface project:
- *   CS  = PB12
- *   RST = PC8
+ * CubeMX emits SPI2_NSS_GPIO_Port / SPI2_NSS_Pin and
+ * WIZ_RSTn_GPIO_Port / WIZ_RSTn_Pin in Core/Inc/main.h. We use those
+ * directly so any pinout change in the .ioc propagates here on regen.
  *---------------------------------------------------------------------------*/
 
 #include "main.h"            /* CubeMX-generated pin label macros */
 
-#ifndef W6100_CS_GPIO_Port
-#define W6100_CS_GPIO_Port   GPIOB
-#define W6100_CS_Pin         GPIO_PIN_12
-#endif
+#define WIZCHIP_CS_GPIO_Port   SPI2_NSS_GPIO_Port
+#define WIZCHIP_CS_Pin         SPI2_NSS_Pin
 
-#ifndef W6100_RST_GPIO_Port
-#define W6100_RST_GPIO_Port  GPIOC
-#define W6100_RST_Pin        GPIO_PIN_8
-#endif
+#define WIZCHIP_RST_GPIO_Port  WIZ_RSTn_GPIO_Port
+#define WIZCHIP_RST_Pin        WIZ_RSTn_Pin
 
 /*----------------------------------------------------------------------------
  * Lifecycle

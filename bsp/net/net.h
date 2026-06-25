@@ -76,7 +76,7 @@ bool net_link_up(void);
  * Returns true on success.
  *---------------------------------------------------------------------------*/
 
-bool net_open (net_sock_t sock, net_proto_t proto, uint16_t local_port, bool listen);
+bool net_open (net_sock_t sock, net_proto_t proto, uint16_t local_port, bool do_listen);
 void net_close(net_sock_t sock);
 
 /*----------------------------------------------------------------------------

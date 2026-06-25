@@ -47,7 +47,7 @@ After flashing and resetting:
 
   You can read it under the debugger by inspecting `s_ring`, `s_head`, `s_tail` in `app/log/log.c`, or by calling `log_peek` from a debugger-injected expression.
 
-- The IWDG runs at 250 ms timeout. To confirm it works, set a breakpoint somewhere in `main_loop_run` and let it sit longer than 250 ms — the device should reset.
+- The hardware watchdog is **not enabled** in this build (see `architecture.md §7.1`); a breakpoint in `main_loop_run` halts indefinitely until released.
 - The push-button is initialised in EXTI mode by CubeMX but unused.
 
 ## What Phase 0b adds
@@ -99,6 +99,5 @@ Same symptom with a different missing header (`socket.h`, `w6100.h`) usually mea
 - **`net_init` fails with bad chip ID**: SPI wiring or speed. Check MISO/MOSI/SCK and try a slower baud rate in the `.ioc`. The reference project succeeded at 21 MHz APB / prescaler 4 ≈ 5 MHz.
 - **PHY link timeout**: cable unplugged, no link partner. Plug into a switch or PC.
 - **`nc` connects but sees nothing**: the device booted before you connected and the ring filled. Check `dropped_lines` in the next heartbeat — anything > 0 means the ring overflowed while no one was listening.
-- **CubeIDE freezes the IWDG on breakpoint by default** because we call `__HAL_DBGMCU_FREEZE_IWDG()` in `wdg_init`. If you want to test the IWDG reset behaviour, comment that line temporarily — but remember to put it back, or every breakpoint resets the device.
 - **HAL_GetTick is overridden implicitly** because our SysTick handler still calls `HAL_IncTick`; `time_ms` then reads `HAL_GetTick`. If you ever switch to a hardware timer for the OS tick instead, you must replace `HAL_GetTick` with a `__weak` override pointing at the new source.
 - **No floats in log_printf.** `LOG_INFO("value=%.2f", x)` will not work — nano-newlib does not link the float-printf path. Use integer scaling: `LOG_INFO("value=%ld.%02ld", x_int, x_frac)`.

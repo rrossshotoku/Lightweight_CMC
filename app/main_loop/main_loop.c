@@ -3,30 +3,39 @@
  *
  * Init order (top of file = first to run):
  *   1. bsp/time     — timekeeping
- *   2. bsp/wdg      — watchdog, latched on (250 ms)
- *   3. app/log      — RAM ring buffer ready to capture init messages
- *   4. app/config   — defaults populated
- *   5. log port set — log_tick can now know where to listen
- *   6. bsp/net      — W6100 brought up; static IP applied
+ *   2. app/log      — RAM ring buffer ready to capture init messages
+ *   3. app/config   — defaults populated
+ *   4. log port set — log_tick can now know where to listen
+ *   5. bsp/net      — W6100 brought up; static IP applied
  *
  * Tick order, repeated forever:
- *   1. wdg_kick()                            — once per pass, only here
- *   2. log_tick()                            — service TCP log socket
- *   3. heartbeat (LED toggle, log every 1 s)
+ *   1. log_tick()                            — service TCP log socket
+ *   2. heartbeat (LED toggle, log every 1 s)
  *
  * Phase 1+ will add controller_mgr, web, motor_ctrl, od, cia402 ticks here.
+ *
+ * NOTE: a hardware watchdog (IWDG) was originally part of this skeleton
+ * but has been removed pending a deliberate enable in the .ioc + a unified
+ * init path. See Documentation/architecture.md §7.1 for the placeholder.
  */
 
 #include "main_loop.h"
 
 #include "app/log/log.h"
 #include "app/config/config.h"
+#include "app/cia402/cia402.h"
+#include "app/axis_manager/axis_manager.h"
+#include "app/od/od.h"
+#include "app/cmc_state/cmc_state.h"
+#include "app/controller_mgr/controller_mgr.h"
+#include "app/persist/persist.h"
+#include "app/web/web.h"
+#include "app/debug/debug.h"
 #include "bsp/time/time.h"
-#include "bsp/wdg/wdg.h"
 #include "bsp/net/net.h"
 
 #include "stm32g4xx_hal.h"
-#include "stm32g4xx_nucleo.h"   /* for BSP_LED_Toggle */
+#include "main.h"               /* CubeMX-generated DEBUG_LED_* macros */
 
 /* Heartbeat: blink LED + INFO log once per second. */
 #define HEARTBEAT_PERIOD_MS  1000
@@ -34,7 +43,6 @@
 void main_loop_init(void)
 {
     time_init();
-    wdg_init(250);                          /* 250 ms timeout */
     log_init();
     config_init();
 
@@ -54,6 +62,21 @@ void main_loop_init(void)
     if (!net_init(net->mac, net->ip, net->netmask, net->gateway)) {
         LOG_ERROR("net_init failed — continuing without network");
     }
+
+    /* Phase 4 cia402 stub + Phase 5 OD network bridge. cia402 currently
+     * returns NOT_READY for every OD request — that's exactly what we
+     * want for now, so a PC tool can exercise the full network path. */
+    /* persist must come BEFORE axis_manager_init so axis_manager can read
+     * its config blob from flash during its own init. */
+    persist_init();
+    cia402_init();
+    axis_manager_init();
+    od_init();
+    cmc_state_init();
+    controller_mgr_init();
+    web_init();
+    debug_init();
+    /* (profile module retired from per-tick use; bsp/time owns DWT init.) */
 }
 
 void main_loop_run(void)
@@ -62,20 +85,33 @@ void main_loop_run(void)
     uint32_t beats = 0;
 
     for (;;) {
-        wdg_kick();
         log_tick();
+        /* axis_manager must run BEFORE cia402 so each cycle's outbound SPI
+         * frame carries the freshest cmd. axis_manager peeks status (stale
+         * by ~1 ms from the previous cycle's RX), composes a new cmd, and
+         * cia402_tick then transmits it on this cycle. */
+        axis_manager_tick();
+        cia402_tick();
+        od_tick();
+        /* cmc_state refreshes its on_shot / moving flags from the live
+         * motor position; cheap and harmless to call every loop. */
+        cmc_state_update_from_motor();
+        controller_mgr_tick();
+        web_tick();
+        debug_tick();
 
         if (time_elapsed_ms(last_beat) >= HEARTBEAT_PERIOD_MS) {
             last_beat += HEARTBEAT_PERIOD_MS;
             beats++;
-            BSP_LED_Toggle(LED_GREEN);
-            LOG_INFO("heartbeat %lu dropped_log_lines=%lu",
-                     (unsigned long)beats,
-                     (unsigned long)log_dropped_lines());
+            g_debug.system.heartbeat_count = beats;
+            HAL_GPIO_TogglePin(DEBUG_LED_GPIO_Port, DEBUG_LED_Pin);
+            /* (No periodic LOG_INFO — the debug log is now event-driven so
+             * the request/dispatch/SDO trace for shot recalls isn't drowned
+             * out by 1Hz heartbeat noise. The LED still blinks as a visual
+             * "alive" indicator and g_debug.system.heartbeat_count remains
+             * inspectable via the debugger.) */
         }
 
-        /* No sleep — the orchestrator polls. Phase 0b adds the network
-         * service which produces real work; until then this is a tight
-         * loop deliberately, so we can confirm IWDG behaviour. */
+        /* No sleep — the orchestrator polls. */
     }
 }

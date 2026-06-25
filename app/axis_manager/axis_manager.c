@@ -1,0 +1,1202 @@
+/*
+ * app/axis_manager — protocol v3 implementation.
+ *
+ * The cyclic command is a tiny 8-byte streaming frame: controlword,
+ * joystick_value, command_counter. Everything else (mode, target_position,
+ * target_time, profile params, joystick scaling) lives on the motor MCU
+ * and is set via SDO (cia402_od_write_begin) before triggering a move.
+ *
+ * Pieces:
+ *  - Data model — values written by protocol modules via cmc_od.
+ *  - Setup-sequencer — when the desired setup differs from what the motor
+ *    MCU has, queue an SDO write. One in flight at a time; the rest queue.
+ *  - compose_cyclic_cmd — builds the streaming command each tick. Adds
+ *    NEW_SETPOINT bit when start_move is pulsed and the setup is fully
+ *    applied. JOYSTICK mode streams joystick_value directly; the motor MCU
+ *    applies it live without needing the trigger.
+ */
+
+#include "axis_manager.h"
+
+#include "app/cia402/cia402.h"
+#include "app/log/log.h"
+#include "app/persist/persist.h"
+#include "bsp/time/time.h"
+
+/* For the on-board UP_BUTTON / DOWN_BUTTON GPIO reads used by
+ * poll_torque_buttons (only effective when op_mode_actual = TORQUE).
+ * CubeMX-generated defines live in Core/Inc/main.h. */
+#include "stm32g4xx_hal.h"
+#include "main.h"
+
+#include <string.h>
+#include <math.h>
+
+/* Motor MCU OD entries we SDO-write during setup (per mc_if_od.h v3). */
+#define OD_MODES_OF_OPERATION     0x6060u
+#define OD_TARGET_TORQUE          0x6071u   /* int32 raw = amps / MC_IF_CUR_SCALE (1e-3 A/LSB) */
+#define OD_TARGET_POSITION        0x607Au
+#define OD_TARGET_POSITION_TIME   0x607Bu
+#define OD_PROFILE_VELOCITY       0x6081u
+#define OD_PROFILE_ACCELERATION   0x6083u
+#define OD_PROFILE_DECELERATION   0x6084u
+
+/* Translate AXIS_OP_MODE_* into the motor MCU's CiA-402 mode_of_operation.
+ *
+ * Note (v3): the motor MCU no longer has a joystick mode. AXIS_OP_MODE_JOYSTICK
+ * is a CMC-only application concept; on the motor side it's just velocity
+ * control — axis_manager streams `velocity_setpoint = joystick_value *
+ * joystick_max_velocity` every cycle, the motor follows it live. */
+static int8_t axis_mode_to_cia402(axis_op_mode_t m)
+{
+    switch (m) {
+    case AXIS_OP_MODE_JOYSTICK:         return (int8_t)MC_IF_MODE_PROFILE_VELOCITY;
+    case AXIS_OP_MODE_PROFILE_VELOCITY: return (int8_t)MC_IF_MODE_PROFILE_VELOCITY;
+    case AXIS_OP_MODE_PROFILE_POSITION: return (int8_t)MC_IF_MODE_PROFILE_POSITION;
+    case AXIS_OP_MODE_HOLD:             return (int8_t)MC_IF_MODE_PROFILE_VELOCITY;
+    case AXIS_OP_MODE_TORQUE:           return (int8_t)MC_IF_MODE_TORQUE;
+    case AXIS_OP_MODE_OFF:
+    default:                             return (int8_t)MC_IF_MODE_DISABLED;
+    }
+}
+
+/* String helpers — used purely for log readability. Kept here so all the
+ * axis-mode/state names are co-located with the to_cia402 map above. */
+static const char *axis_mode_name(axis_op_mode_t m)
+{
+    switch (m) {
+    case AXIS_OP_MODE_OFF:              return "OFF";
+    case AXIS_OP_MODE_JOYSTICK:         return "JOYSTICK";
+    case AXIS_OP_MODE_PROFILE_VELOCITY: return "PROFILE_VELOCITY";
+    case AXIS_OP_MODE_PROFILE_POSITION: return "PROFILE_POSITION";
+    case AXIS_OP_MODE_HOLD:             return "HOLD";
+    case AXIS_OP_MODE_TORQUE:           return "TORQUE";
+    default:                            return "INVALID";
+    }
+}
+
+static const char *axis_state_name(axis_state_t s)
+{
+    switch (s) {
+    case AXIS_STATE_DISABLED: return "DISABLED";
+    case AXIS_STATE_READY:    return "READY";
+    case AXIS_STATE_RUNNING:  return "RUNNING";
+    case AXIS_STATE_FAULT:    return "FAULT";
+    default:                  return "?";
+    }
+}
+
+static const char *seq_step_name(int step)
+{
+    switch (step) {
+    case 0: return "IDLE";
+    case 1: return "MODE";
+    case 2: return "TARGET_POSITION";
+    case 3: return "TARGET_POSITION_TIME";
+    case 4: return "TARGET_TORQUE";
+    case 5: return "PROFILE_VELOCITY";
+    case 6: return "PROFILE_ACCELERATION";
+    case 7: return "PROFILE_DECELERATION";
+    default: return "?";
+    }
+}
+
+/*----------------------------------------------------------------------------
+ * Module state
+ *---------------------------------------------------------------------------*/
+
+typedef struct {
+    /* State (RO from outside, written by axis_manager_tick) */
+    axis_state_t     state;
+    axis_op_mode_t   op_mode_actual;
+    float            position_actual_rad;
+    float            velocity_actual_rad_s;
+    uint16_t         error_code;
+    uint8_t          error_register;
+
+    /* Command latches (set by setters, consumed by tick) */
+    bool             enable_latch;
+    bool             quick_stop_pulse;
+    bool             clear_fault_pulse;
+    bool             start_move_pulse;       /* triggers NEW_SETPOINT once setup is applied */
+
+    /* Mode + per-mode targets (commanded by protocol modules) */
+    axis_op_mode_t   op_mode_commanded;
+    float            joystick_value;         /* -1.0 .. +1.0 (normalised) */
+    float            joystick_max_velocity;  /* rad/s at full deflection (symmetric) */
+    float            target_velocity_rad_s;
+    float            target_position_rad;
+    float            target_time_s;
+    float            target_current_a;       /* REQ-0012 — used in AXIS_OP_MODE_TORQUE */
+    float            button_current_a;       /* 0x302C — magnitude UP/DOWN buttons apply (TORQUE mode only) */
+
+    /* Joystick raw input + linear-with-deadband calibration (0x3026-0x302A) */
+    int32_t          joystick_raw;             /* latest raw value from protocol module */
+    int32_t          joystick_raw_center;      /* rest position */
+    int32_t          joystick_raw_full_pos;    /* raw at full positive deflection */
+    int32_t          joystick_raw_full_neg;    /* raw at full negative deflection */
+    uint32_t         joystick_raw_deadband;    /* +/- around center -> 0 output */
+
+    /* Limits */
+    float            velocity_limit_rad_s;
+    float            position_limit_lo_rad;
+    float            position_limit_hi_rad;
+    float            accel_limit_rad_s2;
+
+    /* Load factor cache — mirrors the motor MCU's 0x2300:5 vel_load_factor
+     * (REQ-0014). The CMC web slider POSTs a new value; we cache it for
+     * GET responses + fire an ad-hoc SDO write so the motor adopts it
+     * for its velocity loop. Persisted by the motor MCU, not by us. */
+    float            load_factor;
+
+    /* Cached from the v4 cyclic status header (REQ-0013/ADR-033). The
+     * motor MCU now puts position + a movement-status bitfield in the
+     * fixed header so the CMC always has them, independent of the
+     * host-configurable telemetry-map content. */
+    uint16_t         movement_status;
+} axis_t;
+
+static axis_t s_axis;
+
+/* Setup snapshot (what the motor MCU has confirmed via OD_WRITE_RESP OK).
+ *
+ * v3: velocity_setpoint is streamed in the cyclic, not SDO-written, so it's
+ * not in this snapshot. joystick_scale also not present — the joystick
+ * concept lives entirely on the LCMC. */
+typedef struct {
+    int8_t   mode;
+    int32_t  target_position_scaled;
+    uint32_t target_position_time_ms;
+    int32_t  target_torque_scaled;
+    uint32_t profile_velocity_scaled;
+    uint32_t profile_acceleration_scaled;
+    uint32_t profile_deceleration_scaled;
+} setup_snapshot_t;
+
+static setup_snapshot_t s_applied;       /* what the motor MCU has */
+static bool             s_first_sync;    /* before first SDO success, force-sync everything */
+
+/* Setup-sequencer in-flight tracking */
+typedef enum {
+    SEQ_IDLE = 0,
+    SEQ_MODE,
+    SEQ_TARGET_POSITION,
+    SEQ_TARGET_POSITION_TIME,
+    SEQ_TARGET_TORQUE,
+    SEQ_PROFILE_VELOCITY,
+    SEQ_PROFILE_ACCELERATION,
+    SEQ_PROFILE_DECELERATION,
+} seq_step_t;
+
+static seq_step_t          s_seq_step;
+static cia402_od_handle_t  s_seq_handle = CIA402_OD_HANDLE_INVALID;
+
+/* NEW_SETPOINT pulse window — held for a few cycles to ensure the motor
+ * MCU sees the rising edge even if cyclic frames are dropped. */
+#define NEW_SETPOINT_PULSE_CYCLES   3u
+static uint8_t s_new_setpoint_remaining;
+
+/* HALT pulse — same shape as NEW_SETPOINT. Operator-driven controlled stop
+ * from CAMERAD panel STOP key (via cmc_state). The motor MCU latches its
+ * own stopped/holding state from the rising edge, so we don't need to
+ * sustain HALT here. Few-cycle pulse for robust edge detection. */
+#define HALT_PULSE_CYCLES           3u
+static uint8_t s_halt_remaining;
+
+/*----------------------------------------------------------------------------
+ * Scaling helpers
+ *---------------------------------------------------------------------------*/
+
+static float clamp_abs(float x, float limit)
+{
+    if (limit < 0.0f) limit = -limit;
+    if (x >  limit) return  limit;
+    if (x < -limit) return -limit;
+    return x;
+}
+
+static float clamp_range(float x, float lo, float hi)
+{
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
+static int32_t to_scaled_i32(float si, float scale)
+{
+    float raw_f = si / scale;
+    if (raw_f >  2147483520.0f) return  2147483520;
+    if (raw_f < -2147483520.0f) return -2147483520;
+    return (int32_t)(raw_f + (raw_f >= 0.0f ? 0.5f : -0.5f));
+}
+
+static uint32_t to_scaled_u32(float si, float scale)
+{
+    if (si <= 0.0f) return 0u;
+    float raw_f = si / scale;
+    if (raw_f > 4294967040.0f) return 4294967040u;
+    return (uint32_t)(raw_f + 0.5f);
+}
+
+/* Apply the joystick calibration to the current raw value, write the
+ * result into joystick_value. Linear with deadband, symmetric output
+ * cap (joystick_max_velocity for both directions). Called when the raw
+ * value or any cal entry changes.
+ *
+ * Output is the normalised SI value (-1..+1), NOT scaled to rad/s yet;
+ * current_velocity_demand_rad_s() multiplies by joystick_max_velocity. */
+static void recompute_joystick_value_from_raw(void)
+{
+    int32_t raw      = s_axis.joystick_raw;
+    int32_t center   = s_axis.joystick_raw_center;
+    int32_t full_pos = s_axis.joystick_raw_full_pos;
+    int32_t full_neg = s_axis.joystick_raw_full_neg;
+    int32_t deadband = (int32_t)s_axis.joystick_raw_deadband;
+    float   v;
+
+    int32_t delta = raw - center;
+    if (delta >  deadband) {
+        int32_t span = (full_pos - center) - deadband;
+        v = (span > 0) ? ((float)(delta - deadband) / (float)span) : 0.0f;
+    } else if (delta < -deadband) {
+        int32_t span = (center - full_neg) - deadband;
+        v = (span > 0) ? -((float)(-delta - deadband) / (float)span) : 0.0f;
+    } else {
+        v = 0.0f;
+    }
+
+    if (v >  1.0f) v =  1.0f;
+    if (v < -1.0f) v = -1.0f;
+    s_axis.joystick_value = v;
+}
+
+/* Live velocity demand to stream in the cyclic command, based on the
+ * current op-mode. JOYSTICK and PROFILE_VELOCITY both produce a velocity;
+ * the cyclic field is the same in both. PROFILE_POSITION and HOLD/OFF
+ * don't drive a streaming velocity (motor uses its trajectory engine for
+ * PROFILE_POSITION, HALT for HOLD, disabled for OFF). */
+static float current_velocity_demand_rad_s(void)
+{
+    switch (s_axis.op_mode_commanded) {
+    case AXIS_OP_MODE_JOYSTICK:
+        return clamp_abs(s_axis.joystick_value * s_axis.joystick_max_velocity,
+                         s_axis.velocity_limit_rad_s);
+    case AXIS_OP_MODE_PROFILE_VELOCITY:
+        return clamp_abs(s_axis.target_velocity_rad_s, s_axis.velocity_limit_rad_s);
+    case AXIS_OP_MODE_PROFILE_POSITION:
+    case AXIS_OP_MODE_HOLD:
+    case AXIS_OP_MODE_OFF:
+    default:
+        return 0.0f;
+    }
+}
+
+/*----------------------------------------------------------------------------
+ * Persistence
+ *
+ * Subset of axis_t that survives reboot. Anything PERSIST-flagged in the
+ * CMC OD lives here. The blob is what app/persist writes/reads to/from
+ * the CMC's internal flash region 0.
+ *
+ * Bump AXIS_PERSIST_VERSION on any layout change so old flash images are
+ * cleanly rejected by persist_load (caller falls back to coded defaults).
+ *---------------------------------------------------------------------------*/
+
+/* v3 (2026-06-25): removed payload_weight_kg — the operator-tunable load
+ * concept moved to motor-owned 0x2300:5 vel_load_factor (REQ-0014). Boards
+ * with a v2 blob in flash get rejected by persist_load (version mismatch)
+ * and fall through to coded defaults — operator needs to re-Save to migrate. */
+#define AXIS_PERSIST_VERSION   3u
+
+typedef struct __attribute__((packed)) {
+    float    joystick_max_velocity;
+    int32_t  joystick_raw_center;
+    int32_t  joystick_raw_full_pos;
+    int32_t  joystick_raw_full_neg;
+    uint32_t joystick_raw_deadband;
+    float    velocity_limit_rad_s;
+    float    position_limit_lo_rad;
+    float    position_limit_hi_rad;
+    float    accel_limit_rad_s2;
+} axis_persist_blob_t;
+
+static void apply_persist_blob(const axis_persist_blob_t *b)
+{
+    s_axis.joystick_max_velocity = b->joystick_max_velocity;
+    s_axis.joystick_raw_center   = b->joystick_raw_center;
+    s_axis.joystick_raw_full_pos = b->joystick_raw_full_pos;
+    s_axis.joystick_raw_full_neg = b->joystick_raw_full_neg;
+    s_axis.joystick_raw_deadband = b->joystick_raw_deadband;
+    s_axis.velocity_limit_rad_s  = b->velocity_limit_rad_s;
+    s_axis.position_limit_lo_rad = b->position_limit_lo_rad;
+    s_axis.position_limit_hi_rad = b->position_limit_hi_rad;
+    s_axis.accel_limit_rad_s2    = b->accel_limit_rad_s2;
+}
+
+static void capture_persist_blob(axis_persist_blob_t *b)
+{
+    b->joystick_max_velocity = s_axis.joystick_max_velocity;
+    b->joystick_raw_center   = s_axis.joystick_raw_center;
+    b->joystick_raw_full_pos = s_axis.joystick_raw_full_pos;
+    b->joystick_raw_full_neg = s_axis.joystick_raw_full_neg;
+    b->joystick_raw_deadband = s_axis.joystick_raw_deadband;
+    b->velocity_limit_rad_s  = s_axis.velocity_limit_rad_s;
+    b->position_limit_lo_rad = s_axis.position_limit_lo_rad;
+    b->position_limit_hi_rad = s_axis.position_limit_hi_rad;
+    b->accel_limit_rad_s2    = s_axis.accel_limit_rad_s2;
+}
+
+bool axis_manager_save_to_flash(void)
+{
+    axis_persist_blob_t blob;
+    capture_persist_blob(&blob);
+    bool ok = persist_save(PERSIST_REGION_CONFIG, &blob, sizeof(blob),
+                           AXIS_PERSIST_VERSION);
+    if (ok) {
+        LOG_INFO("axis_manager: config saved to flash (%u B, v%u)",
+                 (unsigned)sizeof(blob), (unsigned)AXIS_PERSIST_VERSION);
+    } else {
+        LOG_ERROR("axis_manager: config save FAILED");
+    }
+    return ok;
+}
+
+/*----------------------------------------------------------------------------
+ * Lifecycle
+ *---------------------------------------------------------------------------*/
+
+void axis_manager_init(void)
+{
+    memset(&s_axis,    0, sizeof(s_axis));
+    memset(&s_applied, 0, sizeof(s_applied));
+    s_axis.state             = AXIS_STATE_DISABLED;
+    s_axis.op_mode_actual    = AXIS_OP_MODE_OFF;
+    s_axis.op_mode_commanded = AXIS_OP_MODE_OFF;
+
+    s_axis.joystick_max_velocity  = 1.0f;
+    s_axis.velocity_limit_rad_s   = 10.0f;
+    s_axis.position_limit_lo_rad  = -INFINITY;
+    s_axis.position_limit_hi_rad  = +INFINITY;
+    s_axis.accel_limit_rad_s2     = 100.0f;
+    s_axis.load_factor            = 1.0f;     /* no scaling until operator slides */
+
+    /* Joystick cal defaults: matched to CAMERAD MOVEMENT's signed-int8
+     * wire range (-127..+127, 0 = centered) since that's the primary
+     * input today. Other sources (VISCA U7, PC tool F32 etc.) need
+     * different cal — override the four 0x3027-0x302A entries from the
+     * PC tool's CMC Setup tab and "Save to flash". The cal is per-axis,
+     * not per-input-source: assume one stick source at a time. */
+    s_axis.joystick_raw           = 0;
+    s_axis.joystick_raw_center    = 0;
+    s_axis.joystick_raw_full_pos  = 127;
+    s_axis.joystick_raw_full_neg  = -127;
+    s_axis.joystick_raw_deadband  = 0;
+
+    /* Applied snapshot starts with sentinel values that force the
+     * sequencer to write everything once on the first opportunity. */
+    s_applied.mode                        = (int8_t)0x7F;
+    s_applied.target_position_scaled      = INT32_MIN;
+    s_applied.target_position_time_ms     = UINT32_MAX;
+    s_applied.target_torque_scaled        = INT32_MIN;
+    s_applied.profile_velocity_scaled     = UINT32_MAX;
+    s_applied.profile_acceleration_scaled = UINT32_MAX;
+    s_applied.profile_deceleration_scaled = UINT32_MAX;
+
+    s_first_sync           = true;
+    s_seq_step             = SEQ_IDLE;
+    s_seq_handle           = CIA402_OD_HANDLE_INVALID;
+    s_new_setpoint_remaining = 0;
+    s_halt_remaining         = 0;
+
+    /* Attempt to load persisted config from flash. On success this
+     * overrides the coded defaults above; on failure (uninitialised
+     * region, CRC mismatch, version bump) the defaults stand and we
+     * carry on as a fresh-from-factory boot. */
+    axis_persist_blob_t blob;
+    size_t loaded = 0;
+    if (persist_load(PERSIST_REGION_CONFIG, &blob, sizeof(blob),
+                     AXIS_PERSIST_VERSION, &loaded)
+        && loaded == sizeof(blob)) {
+        apply_persist_blob(&blob);
+        LOG_INFO("axis_manager: ready (v3, persisted config loaded). state=DISABLED");
+    } else {
+        LOG_INFO("axis_manager: ready (v3, factory defaults). state=DISABLED");
+    }
+}
+
+/*----------------------------------------------------------------------------
+ * Desired setup snapshot — current value, clamped + scaled
+ *---------------------------------------------------------------------------*/
+
+static void compute_desired(setup_snapshot_t *out)
+{
+    out->mode                        = axis_mode_to_cia402(s_axis.op_mode_commanded);
+
+    float p = clamp_range(s_axis.target_position_rad,
+                          s_axis.position_limit_lo_rad,
+                          s_axis.position_limit_hi_rad);
+    out->target_position_scaled      = to_scaled_i32(p, MC_IF_POS_SCALE);
+
+    /* target_time SI -> ms; saturate to UINT32_MAX. */
+    if (s_axis.target_time_s <= 0.0f) {
+        out->target_position_time_ms = 0u;
+    } else {
+        float ms = s_axis.target_time_s * 1000.0f;
+        if (ms > 4.0e9f) out->target_position_time_ms = UINT32_MAX;
+        else             out->target_position_time_ms = (uint32_t)(ms + 0.5f);
+    }
+
+    /* REQ-0012: torque mode commanded in amps via 0x302B axis_target_current.
+     * Convert to the raw int32 motor expects at 0x6071 (MC_IF_CUR_SCALE
+     * = 1e-3 A/LSB). Effective only when op_mode_actual on the motor is
+     * TORQUE; in other modes the motor MCU ignores 0x6071. We still send
+     * the value so a mode switch into TORQUE picks up the most recent
+     * setpoint without an extra round-trip. */
+    out->target_torque_scaled        = to_scaled_i32(s_axis.target_current_a, MC_IF_CUR_SCALE);
+
+    out->profile_velocity_scaled     = to_scaled_u32(s_axis.velocity_limit_rad_s, MC_IF_VEL_SCALE);
+    out->profile_acceleration_scaled = to_scaled_u32(s_axis.accel_limit_rad_s2,   MC_IF_ACC_SCALE);
+    out->profile_deceleration_scaled = to_scaled_u32(s_axis.accel_limit_rad_s2,   MC_IF_ACC_SCALE);
+}
+
+/*----------------------------------------------------------------------------
+ * SDO setup-sequencer
+ *
+ * If any of the desired setup values differ from what the motor MCU has,
+ * kick off ONE SDO write per tick. Walks the parameters in a fixed order;
+ * once all match, sequencer is idle.
+ *
+ * Returns true if a write is in flight (or just completed); compose_cyclic_cmd
+ * uses this to decide whether to fire NEW_SETPOINT (only when the motor MCU's
+ * stored setup matches what we want).
+ *---------------------------------------------------------------------------*/
+
+/* True if a setup SDO is currently in flight (s_seq_step != IDLE), OR
+ * if there are unwritten desired-vs-applied diffs the sequencer hasn't
+ * yet managed to queue (e.g. cia402's OD pipeline was busy at the time
+ * setup_sequencer_tick tried — start_sdo_write returned IDLE and the
+ * step never advanced). Without this, NEW_SETPOINT can fire before
+ * TARGET_POSITION reaches the motor, causing the move to use the last-
+ * applied target (often 0). Bug discovered 2026-06-25.
+ *
+ * CRITICAL: only check fields the sequencer actually writes. Listing a
+ * field here that's NOT in setup_sequencer_tick's diff chain wedges
+ * NEW_SETPOINT forever (the diff never clears). target_torque_scaled
+ * is computed by compute_desired but the sequencer has no branch to
+ * write it — keep it OUT of this check. */
+static bool setup_sequencer_busy(void)
+{
+    if (s_seq_step != SEQ_IDLE) return true;
+
+    setup_snapshot_t d;
+    compute_desired(&d);
+    if (d.mode                        != s_applied.mode)                        return true;
+    if (d.target_position_scaled      != s_applied.target_position_scaled)      return true;
+    if (d.target_position_time_ms     != s_applied.target_position_time_ms)     return true;
+    if (d.target_torque_scaled        != s_applied.target_torque_scaled)        return true;
+    if (d.profile_velocity_scaled     != s_applied.profile_velocity_scaled)     return true;
+    if (d.profile_acceleration_scaled != s_applied.profile_acceleration_scaled) return true;
+    if (d.profile_deceleration_scaled != s_applied.profile_deceleration_scaled) return true;
+    return false;
+}
+
+static void apply_completed_step(MC_IfOdResult_t res, const setup_snapshot_t *desired)
+{
+    if (res != MC_IF_OD_OK) {
+        /* Failure surfaces here AND in the per-failure log line — the
+         * caller leaves `applied` unchanged so we retry on the next
+         * cycle. The first 8 are logged at WARN; beyond that we
+         * suppress to avoid log flood if something stays broken. */
+        static uint32_t s_failures = 0;
+        if (s_failures < 8u) {
+            LOG_WARN("axis_manager: SDO sdo done step=%s FAIL result=0x%02X (will retry)",
+                     seq_step_name((int)s_seq_step), (unsigned)res);
+            s_failures++;
+        }
+        return;
+    }
+
+    /* Success — log per-step transition so the operator can see the
+     * cmd-acked chain. MODE is the headline one for set_op_mode debugging. */
+    switch (s_seq_step) {
+    case SEQ_MODE:
+        LOG_INFO("axis_manager: SDO sdo done MODE 0x6060 = %d (motor accepted)",
+                 (int)desired->mode);
+        s_applied.mode = desired->mode;
+        break;
+    case SEQ_TARGET_POSITION:
+        LOG_INFO("axis_manager: SDO sdo done TARGET_POSITION 0x607A = %ld (scaled)",
+                 (long)desired->target_position_scaled);
+        s_applied.target_position_scaled = desired->target_position_scaled;
+        break;
+    case SEQ_TARGET_POSITION_TIME:
+        LOG_INFO("axis_manager: SDO sdo done TARGET_POSITION_TIME 0x607B = %lu ms",
+                 (unsigned long)desired->target_position_time_ms);
+        s_applied.target_position_time_ms = desired->target_position_time_ms;
+        break;
+    case SEQ_TARGET_TORQUE:
+        LOG_INFO("axis_manager: SDO sdo done TARGET_TORQUE 0x6071 = %ld (scaled)",
+                 (long)desired->target_torque_scaled);
+        s_applied.target_torque_scaled = desired->target_torque_scaled;
+        break;
+    case SEQ_PROFILE_VELOCITY:
+        LOG_INFO("axis_manager: SDO sdo done PROFILE_VELOCITY 0x6081 = %lu (scaled)",
+                 (unsigned long)desired->profile_velocity_scaled);
+        s_applied.profile_velocity_scaled = desired->profile_velocity_scaled;
+        break;
+    case SEQ_PROFILE_ACCELERATION:
+        LOG_INFO("axis_manager: SDO sdo done PROFILE_ACCELERATION 0x6083 = %lu (scaled)",
+                 (unsigned long)desired->profile_acceleration_scaled);
+        s_applied.profile_acceleration_scaled = desired->profile_acceleration_scaled;
+        break;
+    case SEQ_PROFILE_DECELERATION:
+        LOG_INFO("axis_manager: SDO sdo done PROFILE_DECELERATION 0x6084 = %lu (scaled)",
+                 (unsigned long)desired->profile_deceleration_scaled);
+        s_applied.profile_deceleration_scaled = desired->profile_deceleration_scaled;
+        break;
+    default: break;
+    }
+}
+
+/* Start an SDO write. Returns the new sequencer step on success, SEQ_IDLE
+ * on cia402 queue-full (caller retries next tick). */
+static seq_step_t start_sdo_write(seq_step_t step, uint16_t idx, uint8_t sub,
+                                  MC_IfOdType_t type, const void *data, uint8_t len)
+{
+    cia402_od_handle_t h = cia402_od_write_begin(idx, sub, type, data, len);
+    if (h == CIA402_OD_HANDLE_INVALID) {
+        /* SDO queue full — happens when cia402's OD pipeline already has
+         * an OD_READ/WRITE in flight (probably from the PC tool). We'll
+         * retry on the next tick. Log throttled so a stuck pipeline
+         * doesn't flood the log. */
+        static uint32_t s_busy_log = 0;
+        if (s_busy_log < 8u) {
+            LOG_INFO("axis_manager: SDO sdo start step=%s 0x%04X DEFERRED (cia402 queue full)",
+                     seq_step_name((int)step), (unsigned)idx);
+            s_busy_log++;
+        }
+        return SEQ_IDLE;
+    }
+    LOG_INFO("axis_manager: SDO sdo start step=%s 0x%04X (handle issued)",
+             seq_step_name((int)step), (unsigned)idx);
+    s_seq_handle = h;
+    return step;
+}
+
+static void setup_sequencer_tick(void)
+{
+    /* Stage 1: if a write is in flight, poll for completion. */
+    if (s_seq_step != SEQ_IDLE) {
+        MC_IfOdResult_t res    = MC_IF_OD_OK;
+        uint8_t         buf[8] = {0};
+        uint8_t         vlen   = sizeof(buf);
+        if (!cia402_od_poll(s_seq_handle, &res, buf, &vlen)) return;
+        setup_snapshot_t desired;
+        compute_desired(&desired);
+        apply_completed_step(res, &desired);
+        s_seq_step   = SEQ_IDLE;
+        s_seq_handle = CIA402_OD_HANDLE_INVALID;
+        if (res == MC_IF_OD_OK) s_first_sync = false;
+    }
+
+    if (s_seq_step != SEQ_IDLE) return;   /* still busy (shouldn't reach here) */
+
+    /* Stage 2: find first parameter where desired != applied; start its SDO. */
+    setup_snapshot_t desired;
+    compute_desired(&desired);
+
+    if (desired.mode != s_applied.mode) {
+        s_seq_step = start_sdo_write(SEQ_MODE, OD_MODES_OF_OPERATION, 0,
+                                     MC_IF_T_I8, &desired.mode, 1);
+    } else if (desired.target_position_scaled != s_applied.target_position_scaled) {
+        s_seq_step = start_sdo_write(SEQ_TARGET_POSITION, OD_TARGET_POSITION, 0,
+                                     MC_IF_T_I32, &desired.target_position_scaled, 4);
+    } else if (desired.target_position_time_ms != s_applied.target_position_time_ms) {
+        s_seq_step = start_sdo_write(SEQ_TARGET_POSITION_TIME, OD_TARGET_POSITION_TIME, 0,
+                                     MC_IF_T_U32, &desired.target_position_time_ms, 4);
+    } else if (desired.target_torque_scaled != s_applied.target_torque_scaled) {
+        /* REQ-0012 — write motor 0x6071 target_torque (in raw mA equivalents
+         * after MC_IF_CUR_SCALE). Motor consumes it only when 0x6060 = 4. */
+        s_seq_step = start_sdo_write(SEQ_TARGET_TORQUE, OD_TARGET_TORQUE, 0,
+                                     MC_IF_T_I32, &desired.target_torque_scaled, 4);
+    } else if (desired.profile_velocity_scaled != s_applied.profile_velocity_scaled) {
+        s_seq_step = start_sdo_write(SEQ_PROFILE_VELOCITY, OD_PROFILE_VELOCITY, 0,
+                                     MC_IF_T_U32, &desired.profile_velocity_scaled, 4);
+    } else if (desired.profile_acceleration_scaled != s_applied.profile_acceleration_scaled) {
+        s_seq_step = start_sdo_write(SEQ_PROFILE_ACCELERATION, OD_PROFILE_ACCELERATION, 0,
+                                     MC_IF_T_U32, &desired.profile_acceleration_scaled, 4);
+    } else if (desired.profile_deceleration_scaled != s_applied.profile_deceleration_scaled) {
+        s_seq_step = start_sdo_write(SEQ_PROFILE_DECELERATION, OD_PROFILE_DECELERATION, 0,
+                                     MC_IF_T_U32, &desired.profile_deceleration_scaled, 4);
+    }
+    /* velocity_setpoint streams in the cyclic frame, not via SDO — no
+     * sequencer step. (SEQ_TARGET_TORQUE was wired in by REQ-0012.) */
+}
+
+/*----------------------------------------------------------------------------
+ * Cyclic command composition
+ *---------------------------------------------------------------------------*/
+
+static axis_state_t derive_state_from_status(const MC_IfCyclicStatusHeader_t *hdr)
+{
+    if (hdr->statusword & MC_IF_SW_FAULT)   return AXIS_STATE_FAULT;
+    if (hdr->statusword & MC_IF_SW_ENABLED) return AXIS_STATE_RUNNING;
+    if (hdr->statusword & MC_IF_SW_READY)   return AXIS_STATE_READY;
+    return AXIS_STATE_DISABLED;
+}
+
+static void compose_cyclic_cmd(MC_IfCyclicCommand_t *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    uint16_t cw = 0;
+
+    /* Clear-fault: rising edge for one cycle. */
+    if (s_axis.clear_fault_pulse) {
+        cw |= MC_IF_CW_FAULT_RESET;
+        s_axis.clear_fault_pulse = false;
+    }
+
+    /* Quick-stop: clear QUICK_STOP bit and force-disable. */
+    if (s_axis.quick_stop_pulse) {
+        s_axis.enable_latch      = false;
+        s_axis.quick_stop_pulse  = false;
+        s_new_setpoint_remaining = 0;   /* abandon any pending trigger */
+        s_halt_remaining         = 0;   /* abandon any pending HALT pulse */
+        out->controlword         = cw;     /* QUICK_STOP bit cleared = quick-stop active */
+        return;
+    }
+
+    /* Default: QUICK_STOP set (1 = normal). */
+    cw |= MC_IF_CW_QUICK_STOP;
+
+    if (s_axis.state == AXIS_STATE_FAULT) {
+        out->controlword = cw;
+        return;
+    }
+
+    /* Enable / HALT / HOLD treatment. */
+    if (s_axis.enable_latch && s_axis.op_mode_commanded != AXIS_OP_MODE_OFF) {
+        cw |= MC_IF_CW_ENABLE;
+        if (s_axis.op_mode_commanded == AXIS_OP_MODE_HOLD) {
+            cw |= MC_IF_CW_HALT;
+        }
+    }
+
+    /* Operator-driven HALT (from CAMERAD panel STOP key via cmc_state).
+     * Multi-cycle pulse — motor MCU latches its own stop/hold state on
+     * the rising edge. Auto-expires; no clear-on-new-move bookkeeping
+     * needed since the pulse is finite. */
+    if (s_halt_remaining > 0) {
+        cw |= MC_IF_CW_HALT;
+        s_halt_remaining--;
+    }
+
+    /* Stream the live velocity demand. The motor MCU applies it as the
+     * active velocity target in any velocity-class mode (and ignores it
+     * in PROFILE_POSITION / HOLD / OFF — they don't drive a streaming
+     * velocity). Only emit when enabled, so a disabled drive doesn't see
+     * a non-zero setpoint racing the ENABLE bit. */
+    if (s_axis.enable_latch && s_axis.state != AXIS_STATE_FAULT) {
+        float v = current_velocity_demand_rad_s();
+        out->velocity_setpoint = to_scaled_i32(v, MC_IF_VEL_SCALE);
+    }
+
+    /* NEW_SETPOINT: rising edge fires only when setup is fully applied
+     * (sequencer idle and no remaining diffs). Held high for a few
+     * cycles to ensure the motor MCU sees the rising edge robustly.
+     * Logged once at the rising edge so the trace shows when the
+     * trigger is actually sent (vs. stuck waiting for SDO setup). */
+    if (s_axis.start_move_pulse) {
+        if (!setup_sequencer_busy()) {
+            s_new_setpoint_remaining = NEW_SETPOINT_PULSE_CYCLES;
+            s_axis.start_move_pulse  = false;
+            LOG_INFO("axis_manager: NEW_SETPOINT triggered (setup applied, sending pulse for %u cycles)",
+                     (unsigned)NEW_SETPOINT_PULSE_CYCLES);
+        }
+        /* else: keep the pulse pending; sequencer is still applying setup. */
+    }
+    if (s_new_setpoint_remaining > 0) {
+        cw |= MC_IF_CW_NEW_SETPOINT;
+        s_new_setpoint_remaining--;
+    }
+
+    out->controlword = cw;
+}
+
+/*----------------------------------------------------------------------------
+ * Tick
+ *---------------------------------------------------------------------------*/
+
+/* Defined further down in the load-factor accessor block. Forward-declared
+ * here so axis_manager_tick can drain the pending SDO write each cycle. */
+static void poll_load_factor_sdo(void);
+
+/*----------------------------------------------------------------------------
+ * On-board UP/DOWN button polling — TORQUE-mode current jog
+ *
+ * Both buttons are PB1 / PB2 with pull-downs configured in CubeMX, so a press
+ * reads HIGH (GPIO_PIN_SET). While AXIS_OP_MODE_TORQUE is active we override
+ * target_current_a from the (signed) button state; on release we zero it.
+ *
+ * Debounce: a button is considered "held" after BUTTON_DEBOUNCE_TICKS
+ * consecutive HIGH reads and "released" after BUTTON_DEBOUNCE_TICKS LOW reads.
+ * Counters saturate at BUTTON_DEBOUNCE_TICKS so a long hold doesn't overflow.
+ * At a 1 ms tick rate the debounce window is ~3 ms — imperceptible to a human
+ * but kills mechanical-bounce chatter that would otherwise queue redundant
+ * SDO writes to 0x6071 during the bounce.
+ *
+ * Ownership model: PC-tool writes to 0x302B target_current still take effect
+ * when neither button has been pressed. Once a button transitions to held,
+ * the buttons take ownership and drive target_current each tick until BOTH
+ * are released, at which point we zero target_current (one-shot) and release
+ * ownership. The next PC-tool write then passes through normally. *---------------------------------------------------------------------------*/
+#define BUTTON_DEBOUNCE_TICKS  3u
+
+static uint8_t s_up_filter;          /* counts consecutive HIGH samples, saturates at DEBOUNCE_TICKS */
+static uint8_t s_down_filter;
+static bool    s_up_held;            /* debounced "currently held" */
+static bool    s_down_held;
+static bool    s_buttons_own_current;/* true while CMC is driving target_current from buttons */
+
+static void poll_torque_buttons(void)
+{
+    /* Debounce — sample, accumulate, saturate. */
+    bool up_now   = (HAL_GPIO_ReadPin(UP_BUTTON_GPIO_Port,   UP_BUTTON_Pin)   == GPIO_PIN_SET);
+    bool down_now = (HAL_GPIO_ReadPin(DOWN_BUTTON_GPIO_Port, DOWN_BUTTON_Pin) == GPIO_PIN_SET);
+    s_up_filter   = up_now   ? (uint8_t)((s_up_filter   < BUTTON_DEBOUNCE_TICKS) ? s_up_filter   + 1u : BUTTON_DEBOUNCE_TICKS) : 0u;
+    s_down_filter = down_now ? (uint8_t)((s_down_filter < BUTTON_DEBOUNCE_TICKS) ? s_down_filter + 1u : BUTTON_DEBOUNCE_TICKS) : 0u;
+    s_up_held     = (s_up_filter   >= BUTTON_DEBOUNCE_TICKS);
+    s_down_held   = (s_down_filter >= BUTTON_DEBOUNCE_TICKS);
+
+    /* Outside TORQUE mode the buttons do nothing (and we release ownership
+     * if we held it, restoring write-through for the next mode-switch). */
+    if (s_axis.op_mode_actual != AXIS_OP_MODE_TORQUE) {
+        if (s_buttons_own_current) {
+            s_axis.target_current_a = 0.0f;
+            s_buttons_own_current   = false;
+        }
+        return;
+    }
+
+    bool any_held = s_up_held || s_down_held;
+    if (any_held) {
+        /* Both held simultaneously -> safety zero (the operator's hand
+         * likely slipped onto both; refuse to pick a direction). */
+        float new_current;
+        if (s_up_held && s_down_held)         new_current = 0.0f;
+        else if (s_up_held)                    new_current = +s_axis.button_current_a;
+        else                                    new_current = -s_axis.button_current_a;
+
+        if (!s_buttons_own_current) {
+            LOG_INFO("axis_manager: TORQUE button engaged %s -> target_current = %ld mA",
+                     (s_up_held && s_down_held) ? "BOTH" : (s_up_held ? "UP" : "DOWN"),
+                     (long)lroundf(new_current * 1000.0f));
+            s_buttons_own_current = true;
+        }
+        s_axis.target_current_a = new_current;
+    } else if (s_buttons_own_current) {
+        /* Released both — zero once and hand control back to OD writes. */
+        LOG_INFO("axis_manager: TORQUE buttons released -> target_current = 0");
+        s_axis.target_current_a = 0.0f;
+        s_buttons_own_current   = false;
+    }
+    /* else: no button activity and no prior ownership — PC-tool 0x302B writes pass through. */
+}
+
+void axis_manager_tick(void)
+{
+    /* 1. Pull latest status from cia402 (peek — non-consuming). */
+    MC_IfCyclicStatusHeader_t hdr;
+    uint8_t blob[MC_IF_TLM_BLOB_MAX];
+    uint8_t blob_len = 0;
+    if (cia402_peek_cyclic_status(&hdr, blob, &blob_len)) {
+        /* Snapshot everything BEFORE update so all the edge-detect logs
+         * have access to old values. */
+        uint16_t       prev_error    = s_axis.error_code;
+        axis_state_t   prev_state    = s_axis.state;
+        axis_op_mode_t prev_op_mode  = s_axis.op_mode_actual;
+
+        s_axis.error_code     = hdr.error_code;
+        s_axis.error_register = (uint8_t)(hdr.error_code >> 8);  /* placeholder */
+
+        if (prev_error != s_axis.error_code) {
+            LOG_INFO("axis_manager: error_code 0x%04X -> 0x%04X (from motor)",
+                     (unsigned)prev_error, (unsigned)s_axis.error_code);
+        }
+
+        s_axis.state          = derive_state_from_status(&hdr);
+        if (s_axis.state == AXIS_STATE_RUNNING || s_axis.state == AXIS_STATE_READY) {
+            s_axis.op_mode_actual = s_axis.op_mode_commanded;
+        } else {
+            s_axis.op_mode_actual = AXIS_OP_MODE_OFF;
+        }
+
+        if (prev_state != s_axis.state) {
+            LOG_INFO("axis_manager: state %s -> %s (statusword=0x%04X err=0x%04X)",
+                     axis_state_name(prev_state), axis_state_name(s_axis.state),
+                     (unsigned)hdr.statusword, (unsigned)hdr.error_code);
+        }
+        if (prev_op_mode != s_axis.op_mode_actual) {
+            LOG_INFO("axis_manager: op_mode_actual %s -> %s (mode_display=%d)",
+                     axis_mode_name(prev_op_mode), axis_mode_name(s_axis.op_mode_actual),
+                     (int)hdr.mode_display);
+        }
+
+        /* v4 (REQ-0013/ADR-033): position + movement status now live in
+         * the fixed header so we don't have to parse the host-configurable
+         * telemetry blob to get the most fundamental motor-feedback signal.
+         * Scale from MC_IF_POS_SCALE (1e-5 rad/LSB) into SI rad. */
+        s_axis.position_actual_rad = (float)hdr.position_actual_scaled * MC_IF_POS_SCALE;
+
+        /* Log on edge so the operator can see when motor reports moving /
+         * arriving at target. Don't log on every cycle. */
+        uint16_t prev_move = s_axis.movement_status;
+        s_axis.movement_status = hdr.movement_status;
+        if (prev_move != s_axis.movement_status) {
+            LOG_INFO("axis_manager: movement_status 0x%04X -> 0x%04X (moving=%d on_target=%d)",
+                     (unsigned)prev_move, (unsigned)s_axis.movement_status,
+                     (int)((s_axis.movement_status & MC_IF_MOVE_MOVING)    != 0),
+                     (int)((s_axis.movement_status & MC_IF_MOVE_ON_TARGET) != 0));
+        }
+        /* velocity_actual_rad_s still TODO — would need its own header field
+         * or a parsed telemetry-blob entry. Not blocking any current feature. */
+    }
+
+    /* 2. Drain any pending ad-hoc SDO writes (load_factor) so they release
+     * cia402's OD slot — has to happen BEFORE the setup-sequencer tries
+     * to issue its own writes, otherwise the slot stays held by us. */
+    poll_load_factor_sdo();
+
+    /* 3. Sample the on-board UP/DOWN buttons. In TORQUE mode this drives
+     * target_current_a; the next step (sequencer) will pick up the new
+     * value as a desired-vs-applied diff and queue the 0x6071 SDO write. */
+    poll_torque_buttons();
+
+    /* 4. Drive the SDO setup-sequencer (one outstanding write at a time). */
+    setup_sequencer_tick();
+
+    /* 5. Compose and push the cyclic command for the next outbound frame. */
+    MC_IfCyclicCommand_t cmd;
+    compose_cyclic_cmd(&cmd);
+    cia402_set_cyclic_cmd(&cmd);
+}
+
+/*----------------------------------------------------------------------------
+ * State getters
+ *---------------------------------------------------------------------------*/
+
+axis_state_t   axis_manager_get_state           (void) { return s_axis.state;                 }
+axis_op_mode_t axis_manager_get_op_mode_actual  (void) { return s_axis.op_mode_actual;        }
+float          axis_manager_get_position_actual (void) { return s_axis.position_actual_rad;   }
+float          axis_manager_get_velocity_actual (void) { return s_axis.velocity_actual_rad_s; }
+
+uint16_t       axis_manager_get_movement_status (void) { return s_axis.movement_status; }
+bool           axis_manager_is_moving           (void) { return (s_axis.movement_status & MC_IF_MOVE_MOVING)    != 0u; }
+bool           axis_manager_is_on_target        (void) { return (s_axis.movement_status & MC_IF_MOVE_ON_TARGET) != 0u; }
+uint16_t       axis_manager_get_error_code      (void) { return s_axis.error_code;            }
+uint8_t        axis_manager_get_error_register  (void) { return s_axis.error_register;        }
+
+/*----------------------------------------------------------------------------
+ * Command latches
+ *---------------------------------------------------------------------------*/
+
+bool axis_manager_request_enable(bool enable)
+{
+    s_axis.enable_latch = enable;
+    LOG_INFO("axis_manager: enable=%d", (int)enable);
+    return true;
+}
+
+bool axis_manager_request_quick_stop(void)
+{
+    s_axis.quick_stop_pulse = true;
+    LOG_INFO("axis_manager: QUICK_STOP requested (hard decel + disable)");
+    return true;
+}
+
+/* Controlled-stop + hold (one-shot). Used by CAMERAD panel STOP keys via
+ * cmc_state_stop_movement. Pulses the HALT bit in the cyclic controlword
+ * for HALT_PULSE_CYCLES cycles — the motor MCU latches its own stop/hold
+ * state from the rising edge, so no sustained assertion needed on our
+ * side. Next CUT/FADE just works (motor handles the un-halt on its
+ * own NEW_SETPOINT processing). For a hard quick-stop + disable, use
+ * axis_manager_request_quick_stop instead. */
+bool axis_manager_request_halt(void)
+{
+    s_halt_remaining = HALT_PULSE_CYCLES;
+    LOG_INFO("axis_manager: HALT pulse (one-shot, %u cycles — motor MCU latches stop)",
+             (unsigned)HALT_PULSE_CYCLES);
+    return true;
+}
+
+bool axis_manager_request_clear_fault(void)
+{
+    s_axis.clear_fault_pulse = true;
+    return true;
+}
+
+bool axis_manager_request_start_move(void)
+{
+    s_axis.start_move_pulse = true;
+    /* No need to "clear HALT" here — HALT is a finite pulse now and the
+     * motor MCU is responsible for unlatching its own stopped state on
+     * the next NEW_SETPOINT trigger. */
+    return true;
+}
+
+/*----------------------------------------------------------------------------
+ * Mode + targets
+ *---------------------------------------------------------------------------*/
+
+axis_op_mode_t axis_manager_get_op_mode(void) { return s_axis.op_mode_commanded; }
+
+bool axis_manager_set_op_mode(uint8_t v)
+{
+    switch (v) {
+    case AXIS_OP_MODE_OFF:
+    case AXIS_OP_MODE_JOYSTICK:
+    case AXIS_OP_MODE_PROFILE_VELOCITY:
+    case AXIS_OP_MODE_PROFILE_POSITION:
+    case AXIS_OP_MODE_HOLD:
+    case AXIS_OP_MODE_TORQUE: {
+        axis_op_mode_t old = s_axis.op_mode_commanded;
+        s_axis.op_mode_commanded = (axis_op_mode_t)v;
+        if (old != s_axis.op_mode_commanded) {
+            /* The commanded mode is now `v`; an SDO write to motor MCU's
+             * 0x6060 will follow in setup_sequencer_tick. Watch for
+             * 'sdo start' and 'sdo done' lines + 'op_mode_actual ->' line
+             * to see the full chain — if any of those is missing, that
+             * tells you where the change is getting stuck. */
+            LOG_INFO("axis_manager: set_op_mode %s -> %s (commanded; SDO pending)",
+                     axis_mode_name(old), axis_mode_name((axis_op_mode_t)v));
+        }
+        return true;
+    }
+    default:
+        LOG_WARN("axis_manager: set_op_mode REJECTED unknown value %u", (unsigned)v);
+        return false;
+    }
+}
+
+float axis_manager_get_joystick_value(void) { return s_axis.joystick_value; }
+bool  axis_manager_set_joystick_value(float v)
+{
+    if (v < -1.0f || v > 1.0f) return false;
+    s_axis.joystick_value = v;
+    return true;
+}
+
+float axis_manager_get_joystick_max_velocity(void) { return s_axis.joystick_max_velocity; }
+bool  axis_manager_set_joystick_max_velocity(float v)
+{
+    if (v < 0.0f || isnan(v)) return false;
+    s_axis.joystick_max_velocity = v;
+    return true;
+}
+
+float axis_manager_get_target_velocity(void) { return s_axis.target_velocity_rad_s; }
+bool  axis_manager_set_target_velocity(float v)
+{
+    if (isnan(v)) return false;
+    s_axis.target_velocity_rad_s = v;
+    return true;
+}
+
+float axis_manager_get_target_position(void) { return s_axis.target_position_rad; }
+bool  axis_manager_set_target_position(float v)
+{
+    if (isnan(v)) return false;
+    s_axis.target_position_rad = v;
+    return true;
+}
+
+float axis_manager_get_target_time(void) { return s_axis.target_time_s; }
+bool  axis_manager_set_target_time(float v)
+{
+    if (v < 0.0f || isnan(v)) return false;
+    s_axis.target_time_s = v;
+    return true;
+}
+
+/* REQ-0012 — Commanded current [A] for AXIS_OP_MODE_TORQUE. Just stores;
+ * the actual SDO write to motor 0x6071 happens via setup_sequencer_tick
+ * once compute_desired picks up the new value. NaN rejected; otherwise
+ * accept (negative current = opposite-direction torque is valid). */
+float axis_manager_get_target_current(void) { return s_axis.target_current_a; }
+bool  axis_manager_set_target_current(float amps)
+{
+    if (isnan(amps)) return false;
+    if (s_axis.target_current_a != amps) {
+        LOG_INFO("axis_manager: target_current = %ld mA (sdo write to motor 0x6071 queued)",
+                 (long)lroundf(amps * 1000.0f));
+    }
+    s_axis.target_current_a = amps;
+    return true;
+}
+
+/* On-board UP/DOWN button current magnitude [A]. Reject NaN and negatives
+ * (sign comes from which button — magnitude only here). 0 disables the
+ * buttons effectively (UP/DOWN still take ownership but command 0 A). */
+float axis_manager_get_button_current(void) { return s_axis.button_current_a; }
+bool  axis_manager_set_button_current(float amps)
+{
+    if (isnan(amps) || amps < 0.0f) return false;
+    if (s_axis.button_current_a != amps) {
+        LOG_INFO("axis_manager: button_current = %ld mA (UP -> +I, DOWN -> -I in TORQUE mode)",
+                 (long)lroundf(amps * 1000.0f));
+    }
+    s_axis.button_current_a = amps;
+    return true;
+}
+
+/*----------------------------------------------------------------------------
+ * Limits
+ *---------------------------------------------------------------------------*/
+
+float axis_manager_get_velocity_limit(void) { return s_axis.velocity_limit_rad_s; }
+bool  axis_manager_set_velocity_limit(float v)
+{
+    if (v < 0.0f || isnan(v)) return false;
+    s_axis.velocity_limit_rad_s = v;
+    return true;
+}
+
+float axis_manager_get_position_limit_lo(void) { return s_axis.position_limit_lo_rad; }
+bool  axis_manager_set_position_limit_lo(float v)
+{
+    if (isnan(v)) return false;
+    s_axis.position_limit_lo_rad = v;
+    return true;
+}
+
+float axis_manager_get_position_limit_hi(void) { return s_axis.position_limit_hi_rad; }
+bool  axis_manager_set_position_limit_hi(float v)
+{
+    if (isnan(v)) return false;
+    s_axis.position_limit_hi_rad = v;
+    return true;
+}
+
+float axis_manager_get_accel_limit(void) { return s_axis.accel_limit_rad_s2; }
+bool  axis_manager_set_accel_limit(float v)
+{
+    if (v < 0.0f || isnan(v)) return false;
+    s_axis.accel_limit_rad_s2 = v;
+    return true;
+}
+
+/* Load factor — see header. Set fires an SDO write to motor 0x2300:5
+ * (vel_load_factor, REQ-0014). We don't AWAIT the result synchronously,
+ * but the handle is REMEMBERED and polled each tick — this is critical
+ * because cia402's OD pipeline holds state OD_COMPLETE until polled,
+ * and a stuck OD_COMPLETE wedges every subsequent SDO write (mode
+ * changes, target_position writes, PC tool reads — everything). */
+#define MOTOR_OD_VEL_LOAD_FACTOR_IDX  (0x2300u)
+#define MOTOR_OD_VEL_LOAD_FACTOR_SUB  (5u)
+
+static cia402_od_handle_t s_load_factor_handle = CIA402_OD_HANDLE_INVALID;
+static bool               s_load_factor_pending = false;
+
+float axis_manager_get_load_factor(void) { return s_axis.load_factor; }
+bool  axis_manager_set_load_factor(float v)
+{
+    if (isnan(v) || v < 0.3f || v > 2.0f) {
+        LOG_WARN("axis_manager: set_load_factor REJECTED v=%d/1000 (need 0.3..2.0)",
+                 (int)(v * 1000.0f));
+        return false;
+    }
+    s_axis.load_factor = v;
+
+    /* Don't try to issue a new SDO if we still have one in flight — we'd
+     * just overwrite our own handle and leak the previous OD_COMPLETE slot.
+     * The tick path drains the existing one first; the operator can re-slide
+     * afterwards if they were too fast. */
+    if (s_load_factor_pending) {
+        LOG_INFO("axis_manager: load_factor cached %d/1000 (previous SDO still in flight; will not chain)",
+                 (int)(v * 1000.0f));
+        return true;
+    }
+
+    cia402_od_handle_t h = cia402_od_write_begin(
+        MOTOR_OD_VEL_LOAD_FACTOR_IDX, MOTOR_OD_VEL_LOAD_FACTOR_SUB,
+        MC_IF_T_F32, &s_axis.load_factor, sizeof(float));
+    if (h == CIA402_OD_HANDLE_INVALID) {
+        LOG_WARN("axis_manager: load_factor=%d/1000 cached, cia402 OD pipeline "
+                 "busy — write not issued. Re-slide once it frees up.",
+                 (int)(v * 1000.0f));
+        return true;     /* cache still good; just no motor-side effect this time */
+    }
+    s_load_factor_handle  = h;
+    s_load_factor_pending = true;
+    LOG_INFO("axis_manager: load_factor -> %d/1000 (SDO write queued to motor 0x2300:5, handle=%d)",
+             (int)(v * 1000.0f), (int)h);
+    return true;
+}
+
+/* Called from axis_manager_tick to drain the load-factor SDO write so
+ * the cia402 OD pipeline doesn't stay in OD_COMPLETE. We don't act on
+ * the result — just log success/failure and free the handle. */
+static void poll_load_factor_sdo(void)
+{
+    if (!s_load_factor_pending) return;
+    MC_IfOdResult_t res = MC_IF_OD_OK;
+    uint8_t buf[8] = {0};
+    uint8_t vlen   = sizeof(buf);
+    if (!cia402_od_poll(s_load_factor_handle, &res, buf, &vlen)) {
+        return;  /* still pending — try again next tick */
+    }
+    if (res == MC_IF_OD_OK) {
+        LOG_INFO("axis_manager: load_factor SDO -> motor 0x2300:5 OK (=%d/1000)",
+                 (int)(s_axis.load_factor * 1000.0f));
+    } else {
+        LOG_WARN("axis_manager: load_factor SDO -> motor 0x2300:5 FAIL result=0x%02X "
+                 "(motor MCU may not yet implement REQ-0014)", (unsigned)res);
+    }
+    s_load_factor_handle  = CIA402_OD_HANDLE_INVALID;
+    s_load_factor_pending = false;
+}
+
+/*----------------------------------------------------------------------------
+ * Joystick raw + calibration (0x3026-0x302A)
+ *---------------------------------------------------------------------------*/
+
+int32_t axis_manager_get_joystick_raw(void) { return s_axis.joystick_raw; }
+bool    axis_manager_set_joystick_raw(int32_t v)
+{
+    s_axis.joystick_raw = v;
+    recompute_joystick_value_from_raw();
+    return true;
+}
+
+int32_t axis_manager_get_joystick_raw_center(void) { return s_axis.joystick_raw_center; }
+bool    axis_manager_set_joystick_raw_center(int32_t v)
+{
+    s_axis.joystick_raw_center = v;
+    recompute_joystick_value_from_raw();
+    return true;
+}
+
+int32_t axis_manager_get_joystick_raw_full_pos(void) { return s_axis.joystick_raw_full_pos; }
+bool    axis_manager_set_joystick_raw_full_pos(int32_t v)
+{
+    s_axis.joystick_raw_full_pos = v;
+    recompute_joystick_value_from_raw();
+    return true;
+}
+
+int32_t axis_manager_get_joystick_raw_full_neg(void) { return s_axis.joystick_raw_full_neg; }
+bool    axis_manager_set_joystick_raw_full_neg(int32_t v)
+{
+    s_axis.joystick_raw_full_neg = v;
+    recompute_joystick_value_from_raw();
+    return true;
+}
+
+uint32_t axis_manager_get_joystick_raw_deadband(void) { return s_axis.joystick_raw_deadband; }
+bool     axis_manager_set_joystick_raw_deadband(uint32_t v)
+{
+    s_axis.joystick_raw_deadband = v;
+    recompute_joystick_value_from_raw();
+    return true;
+}
