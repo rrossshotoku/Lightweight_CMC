@@ -367,7 +367,8 @@ static void build_config_json(void)
             "\"ip\":\"%u.%u.%u.%u\","
             "\"netmask\":\"%u.%u.%u.%u\","
             "\"gateway\":\"%u.%u.%u.%u\","
-            "\"cmc_device_no\":%lu"
+            "\"cmc_device_no\":%lu,"
+            "\"tcp_camerad_port\":%u"
           "},"
           "\"limits\":{"
             "\"velocity\":%s,"
@@ -394,6 +395,7 @@ static void build_config_json(void)
         net->netmask[0], net->netmask[1], net->netmask[2], net->netmask[3],
         net->gateway[0], net->gateway[1], net->gateway[2], net->gateway[3],
         (unsigned long)net->cmc_device_no,
+        (unsigned)net->tcp_camerad_port,
         s_vel, s_plo, s_phi, s_acc,
         s_jmax,
         (long)axis_manager_get_joystick_raw_center(),
@@ -434,6 +436,18 @@ static void apply_config_json(const char *json)
         if (p) {
             uint32_t v;
             if (parse_u32(p, &v) && v >= 1u && v <= 255u) cfg.cmc_device_no = v;
+        }
+
+        /* tcp_camerad_port — CAMERAD TCP listener (advertised to panels as
+         * return_port). Takes effect after reboot (listen socket is opened
+         * once in controller_mgr_init). Accept the IANA dynamic range plus
+         * the canonical 30001; reject < 1024 (privileged) and > 65535. */
+        p = find_key(net, "tcp_camerad_port");
+        if (p) {
+            uint32_t v;
+            if (parse_u32(p, &v) && v >= 1024u && v <= 65535u) {
+                cfg.tcp_camerad_port = (uint16_t)v;
+            }
         }
 
         (void)config_set_network(&cfg);

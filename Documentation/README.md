@@ -18,6 +18,7 @@ Reviewers: do not approve a change that touches a module without checking that t
 |---|---|
 | [`architecture.md`](architecture.md) | Master design document for the CMC firmware. Layering rules, module catalogue, data flows, persistent state, network design, decisions log. Defers to `Interface/` for wire formats and OD layout |
 | [`build_setup.md`](build_setup.md) | One-time CubeIDE project setup and per-phase runtime checks |
+| [`dual_bootloader_design.md`](dual_bootloader_design.md) | **Design proposal** for over-the-link firmware updates on both CMC (Ethernet) and motor MCU (SPI), using a common CiA-302-style OD interface. Not implemented; gated on a chip upgrade for flash headroom |
 | `camerad_subset.md` (TBD)            | Exact subset of CAMERAD this CMC implements as a server (opcodes, body shapes, response shapes per device type). Will be drafted alongside Phase 2. CAMERAD is *not* in Interface — it's a Shotoku panel protocol independent of the motor-MCU link |
 
 The previously-mentioned `cia402_profile.md` and `od_index_map.md` are no longer planned — those concerns are owned by `Interface/INTERFACE_SPEC.md` and `Interface/mc_if_od.h` respectively.

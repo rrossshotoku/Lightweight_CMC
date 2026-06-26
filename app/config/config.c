@@ -27,8 +27,9 @@ typedef struct __attribute__((packed)) {
     uint8_t  ip[4];            /*  4 */
     uint8_t  netmask[4];       /*  4 */
     uint8_t  gateway[4];       /*  4 */
-    uint32_t cmc_device_no;    /*  4 */
-    uint32_t reserved[3];      /* 12 — room for one more u32 without a version bump */
+    uint32_t cmc_device_no;    /*  4 — advertised to panels as return_device_no */
+    uint32_t tcp_camerad_port; /*  4 — advertised to panels as return_port; 0 = use compile-time default (no-version-bump migration from v1 blobs where this slot was reserved=0) */
+    uint32_t reserved[2];      /*  8 — room for two more u32s without a version bump */
 } network_persist_blob_t;      /* total: 32 */
 
 _Static_assert(sizeof(network_persist_blob_t) == 32,
@@ -45,7 +46,7 @@ void config_init(void)
     s_network.netmask[0] = 255; s_network.netmask[1] = 255; s_network.netmask[2] = 255; s_network.netmask[3] = 0;
     s_network.gateway[0] = 192; s_network.gateway[1] =   1; s_network.gateway[2] = 0; s_network.gateway[3] = 1;
     s_network.udp_poll_port    = 30002;
-    s_network.tcp_camerad_port = 30003;     /* Reduced CMC default (uc_camd_interface config_flash.h:50). The TCP listener port we advertise in poll responses. The actual TCP exchange uses outbound from CMC to panel's return_port (typically 30001). */
+    s_network.tcp_camerad_port = 30001;     /* CAMERAD TCP listener — port 30001 matches SW050 (NetComms.c LISTENPORT1) so existing S/T panels and tools that target the canonical CAMERAD listen port reach us. Was 30003 (Reduced CMC's value) — moved to 30001 on 2026-06-26 for SW050 compatibility. NOT in the persisted blob, so the default takes effect on next boot with no operator save needed. The CMC still opens outbound TCP from a dynamic port (10000 + slot) to each panel's return_port for push responses; that path is unaffected. */
     s_network.http_port        = 80;
     s_network.od_udp_port      = 5000;
     s_network.log_tcp_port     = 30200;
@@ -66,8 +67,16 @@ void config_init(void)
         memcpy(s_network.netmask, blob.netmask, 4);
         memcpy(s_network.gateway, blob.gateway, 4);
         s_network.cmc_device_no = blob.cmc_device_no;
-        LOG_INFO("config: network loaded from flash (ip=%u.%u.%u.%u dev=%lu)",
+        /* tcp_camerad_port = 0 in flash means "v1 blob predating this field"
+         * (it was reserved=0 before — see struct comment). Fall through to
+         * the compile-time default in that case so the operator doesn't have
+         * to re-save after an upgrade. Any non-zero value overrides. */
+        if (blob.tcp_camerad_port != 0u && blob.tcp_camerad_port <= 0xFFFFu) {
+            s_network.tcp_camerad_port = (uint16_t)blob.tcp_camerad_port;
+        }
+        LOG_INFO("config: network loaded from flash (ip=%u.%u.%u.%u tcp=%u dev=%lu)",
                  s_network.ip[0], s_network.ip[1], s_network.ip[2], s_network.ip[3],
+                 (unsigned)s_network.tcp_camerad_port,
                  (unsigned long)s_network.cmc_device_no);
     } else {
         LOG_INFO("config: network using factory defaults");
@@ -141,13 +150,15 @@ bool config_save_network_to_flash(void)
     memcpy(blob.ip,      s_network.ip,      4);
     memcpy(blob.netmask, s_network.netmask, 4);
     memcpy(blob.gateway, s_network.gateway, 4);
-    blob.cmc_device_no = s_network.cmc_device_no;
+    blob.cmc_device_no    = s_network.cmc_device_no;
+    blob.tcp_camerad_port = (uint32_t)s_network.tcp_camerad_port;
 
     bool ok = persist_save(PERSIST_REGION_NETWORK, &blob, sizeof(blob),
                            NETWORK_PERSIST_VERSION);
     if (ok) {
-        LOG_INFO("config: network saved to flash (ip=%u.%u.%u.%u dev=%lu)",
+        LOG_INFO("config: network saved to flash (ip=%u.%u.%u.%u tcp=%u dev=%lu)",
                  s_network.ip[0], s_network.ip[1], s_network.ip[2], s_network.ip[3],
+                 (unsigned)s_network.tcp_camerad_port,
                  (unsigned long)s_network.cmc_device_no);
     } else {
         LOG_ERROR("config: network save FAILED");

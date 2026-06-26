@@ -28,9 +28,12 @@
 #include "app/od/od.h"
 #include "app/cmc_state/cmc_state.h"
 #include "app/controller_mgr/controller_mgr.h"
+#include "app/led_indicator/led_indicator.h"
 #include "app/persist/persist.h"
 #include "app/web/web.h"
 #include "app/debug/debug.h"
+#include "bsp/buttons/buttons.h"
+#include "bsp/leds/leds.h"
 #include "bsp/time/time.h"
 #include "bsp/net/net.h"
 
@@ -68,9 +71,18 @@ void main_loop_init(void)
      * want for now, so a PC tool can exercise the full network path. */
     /* persist must come BEFORE axis_manager_init so axis_manager can read
      * its config blob from flash during its own init. */
+    bsp_buttons_init();
+    /* LEDs must be initialised BEFORE persist_init/axis_manager_init so the
+     * LED driver is ready to render whatever colour axis_manager loads from
+     * flash on first tick. Failure to start (period mismatch with CubeMX)
+     * is logged but non-fatal — system continues with LEDs dark. */
+    if (!bsp_leds_init()) {
+        LOG_ERROR("bsp_leds_init failed (TIM1 period mismatch?) — LEDs disabled");
+    }
     persist_init();
     cia402_init();
     axis_manager_init();
+    led_indicator_init();
     od_init();
     cmc_state_init();
     controller_mgr_init();
@@ -86,6 +98,11 @@ void main_loop_run(void)
 
     for (;;) {
         log_tick();
+        /* Advance button debounce filters every loop iteration so any
+         * consumer (currently axis_manager) sees a fresh debounced state.
+         * Cheap (two GPIO reads + counter updates); independent of who
+         * actually consumes the state. */
+        bsp_buttons_tick();
         /* axis_manager must run BEFORE cia402 so each cycle's outbound SPI
          * frame carries the freshest cmd. axis_manager peeks status (stale
          * by ~1 ms from the previous cycle's RX), composes a new cmd, and
@@ -98,6 +115,9 @@ void main_loop_run(void)
         cmc_state_update_from_motor();
         controller_mgr_tick();
         web_tick();
+        /* led_indicator_tick reads motor moving state from axis_manager and
+         * link state from bsp/net, then drives bsp_leds. Cheap (~µs). */
+        led_indicator_tick();
         debug_tick();
 
         if (time_elapsed_ms(last_beat) >= HEARTBEAT_PERIOD_MS) {

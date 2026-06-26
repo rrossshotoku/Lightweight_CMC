@@ -46,8 +46,8 @@ from contextlib import contextmanager
 # ============================================================================
 
 UDP_POLL_PORT = 30002             # CMC's POLL UDP listener
-TCP_CMD_PORT  = 30003             # CMC's TCP command listener (panel -> CMC)
-PANEL_RX_PORT = 30001             # CMC opens outbound TCP here for responses
+TCP_CMD_PORT  = 30001             # CMC's TCP command listener (panel -> CMC) — moved 30003 -> 30001 for SW050 compatibility
+PANEL_RX_PORT = 30001             # CMC opens outbound TCP here for responses (panel-side listen port)
 
 HEADER_SIZE   = 64
 

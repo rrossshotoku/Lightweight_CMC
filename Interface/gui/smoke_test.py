@@ -185,8 +185,19 @@ def test_gui_build(model):
     torque_idx = next(i for i in range(win.cmd_mode_combo.count())
                       if win.cmd_mode_combo.itemData(i) == 5)  # MC_AXIS_MODE_TORQUE
     assert win.cmd_mode_combo.model().item(torque_idx).isEnabled()  # REQ-0012 done
-    # Current field + Apply button enabled now (was disabled while REQ-0012 was pending).
-    assert win.cmd_cur_edit.isEnabled()
+    # Mode-based entry-point greying: selecting a mode enables only its group.
+    win.cmd_mode_combo.setCurrentIndex(torque_idx)
+    assert win.cmd_curg.isEnabled() and not win.cmd_posg.isEnabled() and not win.cmd_velg.isEnabled()
+    pos_idx = next(i for i in range(win.cmd_mode_combo.count())
+                   if win.cmd_mode_combo.itemData(i) == 3)  # MC_AXIS_MODE_PROFILE_POSITION
+    win.cmd_mode_combo.setCurrentIndex(pos_idx)
+    assert win.cmd_posg.isEnabled() and not win.cmd_curg.isEnabled()
+    assert not win.cmd_cur_edit.isEnabled()   # current field greyed in Position mode
+    # "Read current mode" readout (axis_op_mode_actual 0x3001 -> label).
+    assert hasattr(win, "cmd_mode_actual_lbl")
+    oma = model.get(0x3001, 0)
+    win._cmd_on_state_read({"entry": oma, "ok": True, "raw": 3, "si": 3})
+    assert "Position" in win.cmd_mode_actual_lbl.text()
     # OD must carry the new CMC-owned entry 0x302B axis_target_current (REQ-0012).
     assert "axis_target_current" in model.by_name
     assert model.by_name["axis_target_current"].key == (0x302B, 0)
@@ -206,7 +217,24 @@ def test_gui_build(model):
                  "cmd_tune_cont", "cmd_tune_active"):
         assert hasattr(win, attr), f"tuning widget {attr} missing"
     tmodes = [win.cmd_tune_mode.itemData(i) for i in range(win.cmd_tune_mode.count())]
-    assert tmodes == [0, 1, 2]   # off / velocity / position
+    assert tmodes == [0, 1, 2, 3]   # off / velocity / position / current
+    # Backend selector (0x2000:6) widget + OD entry.
+    assert hasattr(win, "mcfg_backend") and win.mcfg_backend.count() == 2
+    assert hasattr(win, "mcfg_backend_lbl")   # reads back motor_backend_sel (0x2000:6) on connect
+    assert model.get(0x2000, 6) is not None and model.get(0x2000, 6).name == "motor_backend_sel"
+    # Brushed current loop: bandwidth (0x2400:8) is the editable input; kp/ki (0x2400:6/7) are
+    # DERIVED + read-only (no longer editable rows); measured current is telemetry (0x2410:6).
+    assert (0x2400, 8) in win._mcfg_rows and model.get(0x2400, 8).name == "hb_cur_bandwidth"
+    assert (0x2400, 6) not in win._mcfg_rows and (0x2400, 7) not in win._mcfg_rows
+    assert model.get(0x2400, 6).name == "hb_cur_kp" and model.get(0x2400, 7).name == "hb_cur_ki"
+    assert model.get(0x2410, 6) is not None and model.get(0x2410, 6).name == "tlm_i_arm_a"
+    assert hasattr(win, "mcfg_cur_lbl") and hasattr(win, "mcfg_kp_lbl") and hasattr(win, "mcfg_ki_lbl")
+    # Motor safety envelope (ADR-040): motor-owned, enforced velocity/accel ceilings as config rows.
+    assert (0x2600, 4) in win._mcfg_rows and (0x2600, 5) in win._mcfg_rows
+    assert model.get(0x2600, 4).name == "max_velocity_rad_s" and model.get(0x2600, 5).name == "max_accel_rad_s2"
+    # Soft position limits (ADR-040): manually-set, motor-owned config rows.
+    assert (0x2600, 6) in win._mcfg_rows and (0x2600, 7) in win._mcfg_rows
+    assert model.get(0x2600, 6).name == "pos_limit_lo_rad" and model.get(0x2600, 7).name == "pos_limit_hi_rad"
     for key in [(0x2910, 1), (0x2910, 2), (0x2910, 3), (0x2910, 6), (0x2910, 7)]:
         assert model.get(*key) is not None, f"OD missing 0x{key[0]:04X}:{key[1]}"
     assert model.get(0x2910, 1).name == "test_mode" and model.get(0x2910, 7).name == "test_active"

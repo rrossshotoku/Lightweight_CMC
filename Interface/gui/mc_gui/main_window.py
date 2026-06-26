@@ -78,15 +78,19 @@ _AXIS_STATE_NAMES = {0: "DISABLED", 1: "READY", 2: "RUNNING", 3: "FAULT"}
 MC_TEST_MODE_OFF = 0
 MC_TEST_MODE_VELOCITY = 1
 MC_TEST_MODE_POSITION = 2
+MC_TEST_MODE_CURRENT = 3
 
 # Command-page live readback uses the MOTOR actuals (the CMC's 0x3002/3 aren't populated yet) +
 # the CiA-402 statusword + the tuning generator's active flag (0x2910:7).
 _CMD_STATE_KEYS = [(0x3000, 0), (0x6041, 0), (0x6064, 0), (0x606C, 0), (0x6077, 0), (0x2910, 7)]
+# Motor Config tab live readouts, also handled by _cmd_on_state_read (measured current, derived
+# brushed gains, configured backend). Routed to that handler but NOT command-state polled.
+_MCFG_READOUT_KEYS = [(0x2000, 6), (0x2410, 6), (0x2400, 6), (0x2400, 7), (0x3001, 0)]
 
 # OD tree columns
-_COLUMNS = ["Name", "Index:Sub", "Type", "Acc", "Owner", "Flags", "Value", "Unit", "Watch"]
-_VALUE_COL = 6
-_WATCH_COL = 8
+_COLUMNS = ["Name", "Index:Sub", "Type", "Acc", "Owner", "Category", "Flags", "Value", "Unit", "Watch"]
+_VALUE_COL = 7
+_WATCH_COL = 9
 
 
 class MainWindow(QMainWindow):
@@ -114,6 +118,9 @@ class MainWindow(QMainWindow):
         self.ui_timer = QTimer(self)
         self.ui_timer.timeout.connect(self._refresh_live)
         self.ui_timer.start(100)  # 10 Hz UI refresh from telemetry
+
+        # No independent readout polling: live values come from the telemetry stream (the map), and
+        # static values are read once after an action (derived gains, backend). Avoids OD-queue-full.
 
     # === UI ===================================================================
     def _build_ui(self) -> None:
@@ -221,7 +228,7 @@ class MainWindow(QMainWindow):
                 continue  # hide the 16 raw map words; the map editor handles them
             item = QTreeWidgetItem([
                 e.name, e.id_str, e.type_name, e.access_name,
-                e.owner_name, self._flags_str(e), "", e.unit, "",
+                e.owner_name, self._od_category(e), self._flags_str(e), "", e.unit, "",
             ])
             item.setData(0, Qt.ItemDataRole.UserRole, e.key)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
@@ -233,6 +240,20 @@ class MainWindow(QMainWindow):
             self.tree.resizeColumnToContents(c)
         lay.addWidget(self.tree)
         return box
+
+    @staticmethod
+    def _od_category(e: OdEntry) -> str:
+        """Sortable grouping tag derived from index/name/access (heuristic; click the header to sort)."""
+        idx, name, acc = e.index, e.name.lower(), e.access_name
+        if 0x1000 <= idx <= 0x1FFF or 0x6000 <= idx <= 0x6FFF:
+            return "Standard"
+        if name.startswith("tlm_"):
+            return "Telemetry"
+        if acc == "WO" or any(k in name for k in ("command", "trigger", "save", "factory_reset")):
+            return "Command"
+        if acc == "RO":
+            return "Status"
+        return "Config"
 
     @staticmethod
     def _flags_str(e: OdEntry) -> str:
@@ -281,6 +302,7 @@ class MainWindow(QMainWindow):
             self.cmd_mode_combo.addItem(label, val)
         self.cmd_mode_combo.addItem("Torque (pending CMC — REQ-0012)", MC_AXIS_MODE_TORQUE)
         self.cmd_mode_combo.model().item(self.cmd_mode_combo.count() - 1).setEnabled(False)
+        self.cmd_mode_combo.currentIndexChanged.connect(self._cmd_update_entry_enables)
         mrow.addWidget(self.cmd_mode_combo)
         b_setmode = QPushButton("Set mode")
         b_setmode.clicked.connect(self._cmd_set_mode)
@@ -317,40 +339,114 @@ class MainWindow(QMainWindow):
         srow.addWidget(self.cmd_sw_lbl)
         srow.addStretch(1)
         dl.addLayout(srow)
+        mqrow = QHBoxLayout()
+        b_rdmode = QPushButton("Read current mode")
+        b_rdmode.setToolTip("Read axis_op_mode_actual (0x3001) — the mode the motor is actually running.")
+        b_rdmode.clicked.connect(self._cmd_read_mode)
+        mqrow.addWidget(b_rdmode)
+        mqrow.addWidget(QLabel("Active mode:"))
+        self.cmd_mode_actual_lbl = QLabel("-")
+        self.cmd_mode_actual_lbl.setStyleSheet("font-weight: bold;")
+        mqrow.addWidget(self.cmd_mode_actual_lbl)
+        mqrow.addStretch(1)
+        dl.addLayout(mqrow)
         outer.addWidget(drive)
 
         # --- Velocity / joystick ---
-        velg = QGroupBox("Velocity  (Profile Velocity / Joystick modes)")
+        self.cmd_velg = velg = QGroupBox("Velocity profile  (Profile Velocity / Joystick)")
         vl = QFormLayout(velg)
         vrow = QHBoxLayout()
         self.cmd_vel_edit = QLineEdit()
         self.cmd_vel_edit.setPlaceholderText("rad/s")
-        self.cmd_vel_edit.setMaximumWidth(100)
+        self.cmd_vel_edit.setMinimumWidth(80)  # don't collapse to nothing
         self.cmd_vel_edit.returnPressed.connect(self._cmd_apply_velocity)
-        vrow.addWidget(self.cmd_vel_edit)
+        vrow.addWidget(self.cmd_vel_edit, 1)   # editor takes the slack
         b_av = QPushButton("Apply velocity")
         b_av.clicked.connect(self._cmd_apply_velocity)
-        vrow.addWidget(b_av)
-        vrow.addStretch(1)
+        vrow.addWidget(b_av, 0)
         vl.addRow("Target velocity (0x3023):", vrow)
+        # --- Joystick row (panel-style RAW path, exercises cmc_state cal) ---
+        # Slider acts like a real CAMERAD panel stick: full-positive maps to
+        # the "high" raw value, full-negative to "low". The mapped raw is
+        # written to OD 0x3026 axis_joystick_raw at the same 25 ms cadence
+        # a panel would send MOVEMENT, so the calibration pipeline
+        # (centre / full_pos / full_neg / deadband at 0x3027–0x302A) and
+        # the joystick watchdog in cmc_state get exercised end-to-end —
+        # not just normalisation-bypass via 0x3021 like the old slider did.
         jrow = QHBoxLayout()
         self.cmd_joy_slider = QSlider(Qt.Orientation.Horizontal)
         self.cmd_joy_slider.setRange(-100, 100)
+        self.cmd_joy_slider.setTracking(True)
+        # No write on every drag tick — the 25 ms timer does the pushing.
+        # valueChanged only refreshes the value label so the user sees the
+        # raw value the next tick will send.
         self.cmd_joy_slider.valueChanged.connect(self._cmd_joystick_changed)
-        jrow.addWidget(self.cmd_joy_slider)
-        self.cmd_joy_lbl = QLabel("+0.00")
-        self.cmd_joy_lbl.setMinimumWidth(44)
+        # Snap to centre when the operator lets go — matches the spring-
+        # centred mechanical stick on a real panel. Next 25 ms tick then
+        # sends 0, motor stops.
+        self.cmd_joy_slider.sliderReleased.connect(
+            lambda: self.cmd_joy_slider.setValue(0))
+        jrow.addWidget(self.cmd_joy_slider, 1)
+
+        # Per-direction raw scaling. Defaults match a CAMERAD panel int8
+        # range (+127 / -127); operator can change to match whatever raw
+        # range the calibration was captured against.
+        jrow.addWidget(QLabel("low:"))
+        self.cmd_joy_low_edit = QLineEdit("-127")
+        self.cmd_joy_low_edit.setMaximumWidth(56)
+        self.cmd_joy_low_edit.setToolTip(
+            "Raw value sent when slider is at -100% (full left/down).")
+        jrow.addWidget(self.cmd_joy_low_edit, 0)
+        jrow.addWidget(QLabel("high:"))
+        self.cmd_joy_high_edit = QLineEdit("127")
+        self.cmd_joy_high_edit.setMaximumWidth(56)
+        self.cmd_joy_high_edit.setToolTip(
+            "Raw value sent when slider is at +100% (full right/up).")
+        jrow.addWidget(self.cmd_joy_high_edit, 0)
+
+        self.cmd_joy_lbl = QLabel("0% → raw=0")
+        self.cmd_joy_lbl.setMinimumWidth(110)
         self.cmd_joy_lbl.setStyleSheet("font-family: monospace;")
-        jrow.addWidget(self.cmd_joy_lbl)
-        b_jz = QPushButton("0")
-        b_jz.setMaximumWidth(28)
-        b_jz.clicked.connect(lambda: self.cmd_joy_slider.setValue(0))
-        jrow.addWidget(b_jz)
-        vl.addRow("Joystick (0x3021):", jrow)
-        outer.addWidget(velg)
+        jrow.addWidget(self.cmd_joy_lbl, 0)
+        vl.addRow("Joystick (0x3026 raw):", jrow)
+        # Velocity-demand acceleration ramp (ADR-042) -- smooths the joystick. Motor OD 0x2300:6/7.
+        jkrow = QHBoxLayout()
+        self.cmd_accel_up = QLineEdit()
+        self.cmd_accel_up.setPlaceholderText("up rad/s²")
+        self.cmd_accel_up.setMaximumWidth(96)
+        self.cmd_accel_up.setToolTip("Acceleration ramp while speeding up [rad/s²]. 0 = off. (0x2300:6)")
+        self.cmd_accel_up.returnPressed.connect(self._cmd_apply_accel)
+        jkrow.addWidget(self.cmd_accel_up)
+        self.cmd_accel_dn = QLineEdit()
+        self.cmd_accel_dn.setPlaceholderText("down rad/s²")
+        self.cmd_accel_dn.setMaximumWidth(96)
+        self.cmd_accel_dn.setToolTip("Acceleration ramp while slowing down [rad/s²]. 0 = off. (0x2300:7)")
+        self.cmd_accel_dn.returnPressed.connect(self._cmd_apply_accel)
+        jkrow.addWidget(self.cmd_accel_dn)
+        b_jk = QPushButton("Apply")
+        b_jk.clicked.connect(self._cmd_apply_accel)
+        jkrow.addWidget(b_jk)
+        self.cmd_accel_bypass = QCheckBox("Bypass")
+        self.cmd_accel_bypass.setToolTip("Bypass the ramp (writes 0/0 -> raw joystick) to A/B the smoothing. "
+                                         "Uncheck to re-apply the fields.")
+        self.cmd_accel_bypass.toggled.connect(self._cmd_accel_bypass_toggled)
+        jkrow.addWidget(self.cmd_accel_bypass)
+        jkrow.addStretch(1)
+        vl.addRow("Accel ramp up / down:", jkrow)
+
+        # 25 ms = 40 Hz, matching real-panel MOVEMENT cadence. Started on
+        # first connect; runs continuously while connected (sends 0 when
+        # slider is centred, just like a panel sends MOVEMENT(0) at idle).
+        # Tick writes 0x3026 axis_joystick_raw at the mapped raw value;
+        # cmc_state's auto-mode-switch then puts the motor into JOYSTICK
+        # mode on the first non-zero tick (or via the operator's Mode combo).
+        self.cmd_joy_timer = QTimer(self)
+        self.cmd_joy_timer.setInterval(25)
+        self.cmd_joy_timer.timeout.connect(self._cmd_joystick_tick)
+        self.cmd_joy_timer.start()
 
         # --- Tuning (on-motor test-signal generator; drives the 0x2910 block, ADR-030) ---
-        tuneg = QGroupBox("Tuning  (on-motor test signal)")
+        self.cmd_tuneg = tuneg = QGroupBox("Tuning  (on-motor test signal)")
         tgl = QVBoxLayout(tuneg)
         trow = QHBoxLayout()
         trow.addWidget(QLabel("Mode:"))
@@ -358,6 +454,7 @@ class MainWindow(QMainWindow):
         self.cmd_tune_mode.addItem("Off", MC_TEST_MODE_OFF)
         self.cmd_tune_mode.addItem("Velocity tuning", MC_TEST_MODE_VELOCITY)
         self.cmd_tune_mode.addItem("Position tuning", MC_TEST_MODE_POSITION)
+        self.cmd_tune_mode.addItem("Current tuning", MC_TEST_MODE_CURRENT)
         self.cmd_tune_mode.currentIndexChanged.connect(self._cmd_tune_mode_changed)
         trow.addWidget(self.cmd_tune_mode)
         trow.addStretch(1)
@@ -430,48 +527,44 @@ class MainWindow(QMainWindow):
         hint.setStyleSheet("color: #666; font-size: 10px;")
         hint.setWordWrap(True)
         tgl.addWidget(hint)
-        outer.addWidget(tuneg)
 
         # --- Position ---
-        posg = QGroupBox("Position  (Profile Position mode)")
+        self.cmd_posg = posg = QGroupBox("Position profile  (Profile Position)")
         pl = QHBoxLayout(posg)
-        pl.addWidget(QLabel("Target (rad):"))
+        pl.addWidget(QLabel("Target (rad):"), 0)
         self.cmd_pos_edit = QLineEdit()
-        self.cmd_pos_edit.setMaximumWidth(90)
-        pl.addWidget(self.cmd_pos_edit)
-        pl.addWidget(QLabel("Time (s, 0=ASAP):"))
+        self.cmd_pos_edit.setMinimumWidth(80)
+        pl.addWidget(self.cmd_pos_edit, 1)             # main editor takes the slack
+        pl.addWidget(QLabel("Time (s, 0=ASAP):"), 0)
         self.cmd_time_edit = QLineEdit("0")
-        self.cmd_time_edit.setMaximumWidth(60)
-        pl.addWidget(self.cmd_time_edit)
+        self.cmd_time_edit.setMinimumWidth(50)
+        self.cmd_time_edit.setMaximumWidth(80)         # this one stays narrow (always short string)
+        pl.addWidget(self.cmd_time_edit, 0)
         b_move = QPushButton("Move to position")
         b_move.setToolTip("Writes target_position (0x3024) + target_time (0x3025), then "
                           "pulses start_move (0x3013 → NEW_SETPOINT). Be in Profile Position "
                           "mode and enabled.")
         b_move.clicked.connect(self._cmd_move_position)
-        pl.addWidget(b_move)
-        pl.addStretch(1)
-        outer.addWidget(posg)
+        pl.addWidget(b_move, 0)
 
         # --- Current (REQ-0012, CHANGELOG [4.3.0]) ---
-        curg = QGroupBox("Current / Torque  (axis op-mode = Torque)")
+        self.cmd_curg = curg = QGroupBox("Current  (Torque mode)")
         cl = QHBoxLayout(curg)
-        cl.addWidget(QLabel("Target current (A):"))
+        cl.addWidget(QLabel("Target current (A):"), 0)
         self.cmd_cur_edit = QLineEdit()
-        self.cmd_cur_edit.setMaximumWidth(90)
+        self.cmd_cur_edit.setMinimumWidth(80)
         self.cmd_cur_edit.setToolTip(
             "Commanded current in amps (sign = direction). Written to CMC OD "
             "0x302B axis_target_current; axis_manager SDO-writes motor 0x6071 "
             "target_torque = round(amps / 1e-3). Effective only when "
             "axis_op_mode = Torque (5) and axis_enable = 1.")
-        cl.addWidget(self.cmd_cur_edit)
+        cl.addWidget(self.cmd_cur_edit, 1)             # editor stretches
         b_ac = QPushButton("Apply current")
         b_ac.clicked.connect(self._cmd_apply_current)
-        cl.addWidget(b_ac)
-        cl.addStretch(1)
-        outer.addWidget(curg)
+        cl.addWidget(b_ac, 0)
 
         # --- Feedback (motor actuals) ---
-        fbg = QGroupBox("Feedback  (motor actuals)")
+        self.cmd_fbg = fbg = QGroupBox("Feedback  (motor actuals)")
         fl = QFormLayout(fbg)
         self.cmd_fb_pos = QLabel("-")
         self.cmd_fb_vel = QLabel("-")
@@ -483,7 +576,10 @@ class MainWindow(QMainWindow):
         fl.addRow("Velocity (0x606C):", self.cmd_fb_vel)
         fl.addRow("Torque (0x6077):", self.cmd_fb_torque)
         fl.addRow("Target reached:", self.cmd_fb_reached)
-        outer.addWidget(fbg)
+        # Entry-point groups in display order: position, velocity, current, tuning, feedback.
+        for g in (self.cmd_posg, self.cmd_velg, self.cmd_curg, self.cmd_tuneg, self.cmd_fbg):
+            outer.addWidget(g)
+        self._cmd_update_entry_enables()
 
         outer.addStretch(1)
         return w
@@ -505,6 +601,23 @@ class MainWindow(QMainWindow):
         self._log(f"CMD {what or entry.name} = {value}", "TX")
         self.client.write_async(entry, raw)
 
+    def _cmd_update_entry_enables(self, *_) -> None:
+        """Grey out the entry-point groups that the selected mode doesn't use."""
+        mode = int(self.cmd_mode_combo.currentData())
+        self.cmd_posg.setEnabled(mode == MC_AXIS_MODE_PROFILE_POSITION)
+        self.cmd_velg.setEnabled(mode in (MC_AXIS_MODE_PROFILE_VELOCITY, MC_AXIS_MODE_JOYSTICK))
+        self.cmd_curg.setEnabled(mode == MC_AXIS_MODE_TORQUE)
+        # tuning + feedback stay available in every mode.
+
+    def _cmd_read_mode(self) -> None:
+        """Read the active op mode (axis_op_mode_actual, 0x3001) -> the 'Active mode' label."""
+        if not self.client.connected:
+            QMessageBox.warning(self, "Not connected", "Connect to the CMC first.")
+            return
+        entry = self.od.by_key.get((0x3001, 0))
+        if entry is not None and entry.readable:
+            self.client.read_async(entry)
+
     def _cmd_set_mode(self) -> None:
         self._cmd_write((0x3020, 0), int(self.cmd_mode_combo.currentData()), "axis_op_mode")
 
@@ -516,6 +629,22 @@ class MainWindow(QMainWindow):
 
     def _cmd_clear_fault(self) -> None:
         self._cmd_write((0x3012, 0), 1, "axis_clear_fault")
+
+    def _cmd_accel_bypass_toggled(self, on: bool) -> None:
+        """Bypass = write 0/0 to the accel ramp (raw joystick); un-bypass = re-apply the fields above."""
+        if on:
+            self._cmd_write((0x2300, 6), 0, "vel_accel_up")
+            self._cmd_write((0x2300, 7), 0, "vel_accel_dn")
+        else:
+            self._cmd_apply_accel()
+
+    def _cmd_apply_accel(self) -> None:
+        """Write the velocity-demand acceleration ramp limits (0x2300:6/7, ADR-042)."""
+        for edit, key, name in ((self.cmd_accel_up, (0x2300, 6), "vel_accel_up"),
+                                (self.cmd_accel_dn, (0x2300, 7), "vel_accel_dn")):
+            t = edit.text().strip()
+            if t:
+                self._cmd_write(key, t, name)
 
     def _cmd_apply_velocity(self) -> None:
         text = self.cmd_vel_edit.text().strip()
@@ -530,11 +659,47 @@ class MainWindow(QMainWindow):
         if text:
             self._cmd_write((0x302B, 0), text, "target_current")
 
+    def _cmd_joy_map_raw(self, v_pct: int) -> int | None:
+        """Map slider percent (-100..+100) to a raw int using the user's
+        high/low inputs. Asymmetric mapping: positive percent scales toward
+        high, negative toward low. Returns None if the fields are invalid
+        — caller skips this tick rather than spamming the CMC with bad
+        values."""
+        try:
+            high = int(self.cmd_joy_high_edit.text())
+            low  = int(self.cmd_joy_low_edit.text())
+        except (ValueError, TypeError):
+            return None
+        if v_pct >= 0:
+            return int(round(v_pct / 100.0 * high))
+        else:
+            return int(round(-v_pct / 100.0 * low))
+
     def _cmd_joystick_changed(self, v: int) -> None:
-        val = v / 100.0
-        self.cmd_joy_lbl.setText(f"{val:+.2f}")
-        if self.client.connected:
-            self._cmd_write((0x3021, 0), val, "joystick_value")
+        # Only refresh the readout. Network write happens on the 25 ms timer
+        # — this avoids two writes per drag tick and keeps the cadence even
+        # when the slider is idle (matches a real panel).
+        raw = self._cmd_joy_map_raw(v)
+        self.cmd_joy_lbl.setText(f"{v:+d}% → raw={raw if raw is not None else '?'}")
+
+    def _cmd_joystick_tick(self) -> None:
+        """Fires every 25 ms (40 Hz) while the GUI is alive. When connected,
+        sends the slider's current mapped raw to OD 0x3026 — exactly the
+        path a CAMERAD panel takes. Logs go to the protocol debug stream,
+        not the GUI's debug console (40 Hz × 60 = 2400 lines/min would
+        drown everything else)."""
+        if not self.client.connected:
+            return
+        raw = self._cmd_joy_map_raw(self.cmd_joy_slider.value())
+        if raw is None:
+            return
+        entry = self.od.by_key.get((0x3026, 0))
+        if entry is None:
+            return
+        # write_async directly — bypass _cmd_write so we don't log per tick.
+        # The CMC's cmc_od logs 0x3026 writes only when they pass
+        # is_loggable_write, which excludes this high-rate setpoint path.
+        self.client.write_async(entry, raw)
 
     def _cmd_move_position(self) -> None:
         pos = self.cmd_pos_edit.text().strip()
@@ -574,6 +739,8 @@ class MainWindow(QMainWindow):
         key = res["entry"].key
         if key == (0x3000, 0):
             self.cmd_state_lbl.setText(_AXIS_STATE_NAMES.get(int(res["raw"]), str(res["raw"])))
+        elif key == (0x3001, 0):
+            self.cmd_mode_actual_lbl.setText(dict(_AXIS_MODES).get(int(res["raw"]), str(res["raw"])))
         elif key == (0x6041, 0):
             sw = int(res["raw"])
             self.cmd_sw_lbl.setText(self._cmd_sw_decode(sw))
@@ -586,6 +753,18 @@ class MainWindow(QMainWindow):
             self.cmd_fb_torque.setText(f"{res['si']:.5g} A")
         elif key == (0x2910, 7):   # test_active (tuning generator running)
             self.cmd_tune_active.setText("RUNNING" if int(res["raw"]) else "idle")
+        elif key == (0x2410, 6):   # measured armature current -> Motor Config readout
+            self.mcfg_cur_lbl.setText(f"{res['si']:.3f} A")
+        elif key == (0x2400, 6):   # derived brushed kp (RO) -> Motor Config readout
+            self.mcfg_kp_lbl.setText(f"{res['si']:.3g}")
+        elif key == (0x2400, 7):   # derived brushed ki (RO) -> Motor Config readout
+            self.mcfg_ki_lbl.setText(f"{res['si']:.4g}")
+        elif key == (0x2000, 6):   # configured drive backend -> Motor Config readout
+            be = int(res["raw"])
+            self.mcfg_backend_lbl.setText("Brushed DC (H-bridge)" if be else "BLDC / PMSM (FOC)")
+            idx = self.mcfg_backend.findData(be)
+            if idx >= 0:
+                self.mcfg_backend.setCurrentIndex(idx)
 
     # --- velocity-pulse generator (GUI-side; drives 0x3023 over time) ---
     def _cmd_tune_mode_changed(self) -> None:
@@ -596,6 +775,9 @@ class MainWindow(QMainWindow):
         if mode == MC_TEST_MODE_POSITION:
             self.cmd_tune_amp_unit.setText("rad")
             self.cmd_tune_rate_unit.setText("rad/s")
+        elif mode == MC_TEST_MODE_CURRENT:
+            self.cmd_tune_amp_unit.setText("A")
+            self.cmd_tune_rate_unit.setText("A/s")
         else:
             self.cmd_tune_amp_unit.setText("rad/s")
             self.cmd_tune_rate_unit.setText("rad/s²")
@@ -606,6 +788,8 @@ class MainWindow(QMainWindow):
             self._cmd_set_op_mode(MC_AXIS_MODE_PROFILE_VELOCITY)
         elif mode == MC_TEST_MODE_POSITION:
             self._cmd_set_op_mode(MC_AXIS_MODE_PROFILE_POSITION)
+        elif mode == MC_TEST_MODE_CURRENT:
+            self._cmd_set_op_mode(MC_AXIS_MODE_TORQUE)
 
     def _cmd_set_op_mode(self, mode_val: int) -> None:
         """Point the operational-mode combo at mode_val and write axis_op_mode (0x3020)."""
@@ -623,7 +807,7 @@ class MainWindow(QMainWindow):
         if mode == MC_TEST_MODE_OFF:
             QMessageBox.information(
                 self, "Select a tuning mode",
-                "Pick Velocity tuning or Position tuning first (it also sets the operational mode); "
+                "Pick Velocity, Position, or Current tuning first (it also sets the operational mode); "
                 "then Enable the drive and Fire.")
             return
         try:
@@ -747,6 +931,14 @@ class MainWindow(QMainWindow):
                 self._setup_rows[key] = row_widgets
             outer.addWidget(box)
 
+        # CMC on-board indicator LED (PC0/PC1/PC2 = TIM1_CH1/2/3 PWM).
+        # Lives on this page because LED colour rides the same axis_persist
+        # blob as the other operator tunables — the "Save to flash" button
+        # below commits LED + joystick + limits in one shot. The CMC firmware
+        # drives the pattern (boot solid -> network-link 3x flash -> breathing
+        # while motor moves / idle solid); the operator just picks the colour.
+        outer.addWidget(self._build_led_panel())
+
         # Bottom buttons row
         btns = QHBoxLayout()
         b_read_all = QPushButton("Read all")
@@ -787,38 +979,41 @@ class MainWindow(QMainWindow):
         h = QHBoxLayout(container)
         h.setContentsMargins(0, 0, 0, 0)
 
+        # Row layout uses HBox stretch factors to let the editor and status
+        # fields absorb extra horizontal space when the side panel is wide,
+        # while the static labels stay sized to their content. This replaces
+        # the previous pattern of setMaximumWidth on the editor + trailing
+        # addStretch which kept the editor pinned narrow regardless of panel
+        # width, making the Motor Config tab look cramped at any window size.
         current = QLabel("-")
         current.setMinimumWidth(80)
         current.setStyleSheet("font-family: monospace; color: #444;")
-        h.addWidget(current)
+        h.addWidget(current, 0)
 
         editor = QLineEdit()
         editor.setPlaceholderText("new value")
-        editor.setMaximumWidth(110)
-        # Enter applies — convenience for keyboard-only editing.
+        editor.setMinimumWidth(80)            # never collapse to nothing
+        # NO setMaximumWidth — let it grow with the panel.
         editor.returnPressed.connect(lambda e=entry: self._setup_apply(e.key))
-        h.addWidget(editor)
+        h.addWidget(editor, 1)                # stretch factor 1: this is the row's growable cell
 
         # Unit label sits between the editor and the Apply button so the
         # operator sees the expected units (rad/s, rad, etc.) while typing.
-        # Use entry.unit (from parse_od_header), falling back to the type
-        # name for unitless entries (e.g. raw integer counts).
         unit_text = entry.unit if entry.unit else f"({entry.type_name})"
         unit_lbl = QLabel(unit_text)
         unit_lbl.setStyleSheet("color: #666; font-style: italic;")
         unit_lbl.setMinimumWidth(50)
-        h.addWidget(unit_lbl)
+        h.addWidget(unit_lbl, 0)
 
         apply_btn = QPushButton("Apply")
         apply_btn.clicked.connect(lambda _checked=False, e=entry: self._setup_apply(e.key))
-        h.addWidget(apply_btn)
+        h.addWidget(apply_btn, 0)
 
         status = QLabel("")
         status.setStyleSheet("color: #666; font-size: 10px;")
         status.setMinimumWidth(60)
-        h.addWidget(status)
-
-        h.addStretch(1)
+        h.addWidget(status, 0)                # static-width label, no stretch
+        # Removed trailing addStretch — the editor cell now does the stretching.
         return {
             "container": container,
             "current":   current,
@@ -872,6 +1067,8 @@ class MainWindow(QMainWindow):
         row["status"].setStyleSheet("color: #666; font-size: 10px;")
         self.client.write_async(entry, raw)
         self._log(f"SETUP WRITE {entry.label} = {text}", "TX")
+        if key in ((0x2000, 3), (0x2000, 4), (0x2400, 8)):  # R / L / bandwidth -> re-read derived gains
+            QTimer.singleShot(100, self._mcfg_read_gains)
 
     # Write MC_IF_SAVE_MAGIC (0x7376) to OD 0x3050 cmc_save_config.
     # The CMC's cmc_od dispatches to axis_manager_save_to_flash() which
@@ -944,15 +1141,21 @@ class MainWindow(QMainWindow):
         ("Velocity loop gains (0x2300)", [
             (0x2300, 1), (0x2300, 2), (0x2300, 3), (0x2300, 4),
             (0x2300, 5),  # vel_load_factor (REQ-0014) — operator load multiplier on kp/ki
+            (0x2300, 6), (0x2300, 7),   # velocity-demand jerk limits (ADR-042)
         ]),
-        ("FOC current loop gains (0x2400)", [
+        ("Current loop gains (0x2400)", [
             (0x2400, 1), (0x2400, 2), (0x2400, 3), (0x2400, 4), (0x2400, 5),
+            (0x2400, 8),   # brushed current-loop bandwidth wc -> derives kp/ki (ADR-039)
         ]),
         ("State estimator (0x2500)", [
-            (0x2500, 1), (0x2500, 2), (0x2500, 3), (0x2500, 4), (0x2500, 5), (0x2500, 6),
+            # 0x2500:1 est_electrical_offset is a calibration RESULT (set by the align routine), not an
+            # editable config -- it would be overwritten if set, so it's not an editable row here.
+            (0x2500, 2), (0x2500, 3), (0x2500, 4), (0x2500, 5), (0x2500, 6),
         ]),
         ("Faults / limits (0x2600)", [
             (0x2600, 2),
+            (0x2600, 4), (0x2600, 5),   # motor safety envelope: vel/accel ceiling (ADR-040; 0 = disabled)
+            (0x2600, 6), (0x2600, 7),   # soft position limits, home-rel (ADR-040; lo>=hi = disabled)
         ]),
         ("Motion profile (CiA-402)", [
             (0x6081, 0), (0x6083, 0), (0x6084, 0), (0x6085, 0),
@@ -981,6 +1184,59 @@ class MainWindow(QMainWindow):
         intro.setWordWrap(True)
         intro.setStyleSheet("padding: 4px; color: #234;")
         col.addWidget(intro)
+
+        # Drive backend selector (0x2000:6) -- per-board; applied at boot, so save + reboot to take effect.
+        bb = QGroupBox("Drive backend")
+        bbl = QHBoxLayout(bb)
+        bbl.addWidget(QLabel("Backend:"))
+        self.mcfg_backend = QComboBox()
+        self.mcfg_backend.addItem("BLDC / PMSM (FOC, 3-shunt)", 0)
+        self.mcfg_backend.addItem("Brushed DC (H-bridge)", 1)
+        bbl.addWidget(self.mcfg_backend)
+        b_bset = QPushButton("Set + save…")
+        b_bset.setToolTip("Write motor_backend_sel (0x2000:6). It selects the drive path and the "
+                          "current-sense ADC channel at boot, so Save to flash and power-cycle to apply.")
+        b_bset.clicked.connect(self._mcfg_set_backend)
+        bbl.addWidget(b_bset)
+        bbl.addSpacing(16)
+        bbl.addWidget(QLabel("Configured:"))
+        self.mcfg_backend_lbl = QLabel("— (read on connect)")
+        self.mcfg_backend_lbl.setStyleSheet("font-weight: bold;")
+        self.mcfg_backend_lbl.setToolTip("What the motor reports for motor_backend_sel (0x2000:6) — "
+                                         "the persisted selection; applies on reboot.")
+        bbl.addWidget(self.mcfg_backend_lbl)
+        bbl.addStretch(1)
+        col.addWidget(bb)
+
+        # Live current-loop readouts. Measured current streams via the telemetry map (no polling); the
+        # derived gains are read once on connect + ~100 ms after an R/L/bandwidth edit.
+        cg = QGroupBox("Live current loop")
+        cgl = QHBoxLayout(cg)
+        cgl.addWidget(QLabel("Armature current:"))
+        self.mcfg_cur_lbl = QLabel("—")
+        self.mcfg_cur_lbl.setStyleSheet("font-family: monospace; font-weight: bold;")
+        self.mcfg_cur_lbl.setToolTip("Updates only while tlm_i_arm_a (0x2410:6) is in the telemetry "
+                                     "map (it's in the default map; re-add it on the Telemetry tab if "
+                                     "you customise the map).")
+        cgl.addWidget(self.mcfg_cur_lbl)
+        note = QLabel("(add tlm_i_arm_a to telemetry map for live)")
+        note.setStyleSheet("color:#888; font-size:10px;")
+        cgl.addWidget(note)
+        cgl.addSpacing(16)
+        cgl.addWidget(QLabel("derived kp:"))
+        self.mcfg_kp_lbl = QLabel("—")
+        self.mcfg_kp_lbl.setStyleSheet("font-family: monospace;")
+        cgl.addWidget(self.mcfg_kp_lbl)
+        cgl.addSpacing(8)
+        cgl.addWidget(QLabel("ki:"))
+        self.mcfg_ki_lbl = QLabel("—")
+        self.mcfg_ki_lbl.setStyleSheet("font-family: monospace;")
+        cgl.addWidget(self.mcfg_ki_lbl)
+        gnote = QLabel("(read after edit)")
+        gnote.setStyleSheet("color:#888; font-size:10px;")
+        cgl.addWidget(gnote)
+        cgl.addStretch(1)
+        col.addWidget(cg)
 
         for group_title, keys in self._MOTORCFG_GROUPS:
             box = QGroupBox(group_title)
@@ -1044,6 +1300,104 @@ class MainWindow(QMainWindow):
         if self.od.by_key.get((0x2800, 2)) is not None:
             self._mcfg_status[(0x2800, 2)] = self.lbl_store_status
         return w
+
+    def _build_led_panel(self) -> QWidget:
+        """RGB sliders for the CMC's on-board status LED (OD 0x3060/61/62).
+
+        Each slider sends a write to its OD entry on release (sliderReleased
+        signal) — not on every drag tick, so we don't flood the CMC with
+        writes while the operator is dragging. Live colour swatch updates
+        on drag. "Save to flash" writes MC_IF_SAVE_MAGIC to 0x3050 which is
+        the same trigger the existing Motor Config save uses (rides the
+        axis_persist blob bumped to v4 for the LED bytes).
+        """
+        box = QGroupBox("Indicator LED  (CMC on-board RGB)")
+        col = QVBoxLayout(box)
+        col.addWidget(QLabel(
+            "Pick a colour for the CMC's status LED. The CMC firmware drives "
+            "the pattern (solid at boot → 3-flash on network link → breathing "
+            "while the motor moves → idle solid); you're just choosing the hue."))
+
+        self._led_sliders: dict[str, QSlider] = {}
+        self._led_value_labels: dict[str, QLabel] = {}
+        for channel, idx in (("R", 0x3060), ("G", 0x3061), ("B", 0x3062)):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f"{channel}:"))
+            s = QSlider(Qt.Orientation.Horizontal)
+            s.setRange(0, 255)
+            s.setValue(0)
+            s.valueChanged.connect(self._led_on_slider_drag)
+            # Apply on release so we don't write 255 OD-writes during a drag.
+            s.sliderReleased.connect(
+                lambda ch=channel, idx=idx: self._led_apply(ch, idx))
+            row.addWidget(s, 1)
+            v = QLabel("0")
+            v.setMinimumWidth(36)
+            v.setStyleSheet("font-family: monospace;")
+            row.addWidget(v, 0)
+            col.addLayout(row)
+            self._led_sliders[channel] = s
+            self._led_value_labels[channel] = v
+
+        # Live preview swatch + Save button row.
+        bar = QHBoxLayout()
+        self._led_swatch = QLabel("                    ")
+        self._led_swatch.setFixedHeight(28)
+        self._led_swatch.setStyleSheet("background-color: rgb(0,0,0); border: 1px solid #888;")
+        bar.addWidget(self._led_swatch, 1)
+        b_read = QPushButton("Read LED")
+        b_read.setToolTip("Read current 0x3060/61/62 from the CMC into the sliders.")
+        b_read.clicked.connect(self._led_read_all)
+        bar.addWidget(b_read, 0)
+        b_save = QPushButton("Save to flash")
+        b_save.setToolTip(
+            "Writes MC_IF_SAVE_MAGIC (0x7376) to 0x3050 cmc_save_config — "
+            "commits LED colour + every other axis_persist value to flash.")
+        b_save.clicked.connect(self._led_save)
+        bar.addWidget(b_save, 0)
+        col.addLayout(bar)
+        return box
+
+    def _led_on_slider_drag(self, _v: int) -> None:
+        # Update the value labels + preview swatch on every tick of the drag.
+        # No network write here — that happens on sliderReleased.
+        r = self._led_sliders["R"].value()
+        g = self._led_sliders["G"].value()
+        b = self._led_sliders["B"].value()
+        self._led_value_labels["R"].setText(str(r))
+        self._led_value_labels["G"].setText(str(g))
+        self._led_value_labels["B"].setText(str(b))
+        self._led_swatch.setStyleSheet(
+            f"background-color: rgb({r},{g},{b}); border: 1px solid #888;")
+
+    def _led_apply(self, channel: str, idx: int) -> None:
+        v = self._led_sliders[channel].value()
+        self._cmd_write((idx, 0), v, f"led_color_{channel.lower()}")
+
+    def _led_save(self) -> None:
+        # 0x3050 cmc_save_config = MC_IF_SAVE_MAGIC (0x7376). Same trigger
+        # as the existing Motor Config save; covers LED colour too now.
+        self._cmd_write((0x3050, 0), 0x7376, "cmc_save_config")
+
+    def _led_read_all(self) -> None:
+        # Issue three OD reads; on each completion _on_read_done routes the
+        # value back into the slider via _led_on_read (see _on_read_done
+        # dispatcher — the (0x3060/61/62) keys are recognised there).
+        for idx in (0x3060, 0x3061, 0x3062):
+            entry = self.od.by_key.get((idx, 0))
+            if entry is not None and self.client.connected:
+                self.client.read_async(entry)
+
+    def _led_on_read(self, channel: str, raw: int) -> None:
+        # Called from _on_read_done when one of the LED-colour entries
+        # comes back. Block signals so setValue doesn't fire the apply path.
+        s = self._led_sliders.get(channel)
+        if s is None:
+            return
+        s.blockSignals(True)
+        s.setValue(raw & 0xFF)
+        s.blockSignals(False)
+        self._led_on_slider_drag(raw & 0xFF)
 
     def _build_motorcfg_actions(self) -> QWidget:
         box = QGroupBox("Calibration")
@@ -1121,6 +1475,21 @@ class MainWindow(QMainWindow):
         lay.addLayout(fr)
         return box
 
+    def _mcfg_set_backend(self) -> None:
+        """Write motor_backend_sel (0x2000:6). Applied at boot, so prompt to save + power-cycle."""
+        if not self.client.connected:
+            QMessageBox.warning(self, "Not connected", "Connect to the CMC first.")
+            return
+        sel = int(self.mcfg_backend.currentData())
+        self._cmd_write((0x2000, 6), sel, "motor_backend_sel")
+        QTimer.singleShot(200, self._mcfg_read_backend)   # refresh the "Configured:" readout
+        name = "Brushed DC (H-bridge)" if sel else "BLDC / PMSM (FOC)"
+        QMessageBox.information(
+            self, "Backend selected",
+            f"Wrote motor_backend_sel = {sel} ({name}).\n\n"
+            "Now click 'Save to flash', then power-cycle the controller — the backend and the "
+            "current-sense ADC channel are applied at boot.")
+
     def _mcfg_read_all(self) -> None:
         if not self.client.connected:
             self._log("Motor Config: not connected", "WARN")
@@ -1130,6 +1499,22 @@ class MainWindow(QMainWindow):
             if entry and entry.readable:
                 self.client.read_async(entry)
         self._mcfg_read_status()
+
+    def _mcfg_read_backend(self) -> None:
+        """Read the configured drive backend (0x2000:6) -> the 'Configured:' readout."""
+        be = self.od.get(0x2000, 6)
+        if self.client.connected and be is not None and be.readable:
+            self.client.read_async(be)
+
+    def _mcfg_read_gains(self) -> None:
+        """Read the motor-derived brushed gains (0x2400:6/7) once. They only change when R/L/bandwidth
+        are edited, so this is called on connect + ~100 ms after such an edit -- never polled."""
+        if not self.client.connected:
+            return
+        for key in ((0x2400, 6), (0x2400, 7)):
+            entry = self.od.by_key.get(key)
+            if entry and entry.readable:
+                self.client.read_async(entry)
 
     def _mcfg_read_status(self) -> None:
         if not self.client.connected:
@@ -1363,6 +1748,7 @@ class MainWindow(QMainWindow):
         self._log("socket open" if connected else "link down", "INFO")
         self._last_sample_time = 0.0
         self.latest_sample = None
+        self.mcfg_backend_lbl.setText("reading…" if connected else "— (disconnected)")
         if connected:
             # auto-probe so you immediately know whether the CMC is actually answering
             probe = self.od.get(0x1000, 0) or self.od.get(0x6041, 0)
@@ -1371,6 +1757,9 @@ class MainWindow(QMainWindow):
                           "TX")
                 self._probe_key = probe.key
                 self.client.read_async(probe)
+            # read the configured backend (0x2000:6) + derived gains (0x2400:6/7) once, on connect
+            self._mcfg_read_backend()
+            self._mcfg_read_gains()
         else:
             self._probe_key = None
 
@@ -1475,8 +1864,16 @@ class MainWindow(QMainWindow):
             else:
                 self._mcfg_status[entry.key].setText(f"<{res.get('error', 'error')}>")
         # Motor Command tab: route axis/motor state read-backs to the command labels.
-        if entry.key in _CMD_STATE_KEYS:
+        if (entry.key in _CMD_STATE_KEYS or entry.key in _MCFG_READOUT_KEYS) and res.get("ok"):
             self._cmd_on_state_read(res)
+        # Motor Config tab: route LED-colour read-backs (0x3060/61/62) into the
+        # sliders so "Read LED" pulls the live values from the CMC.
+        if res.get("ok") and entry.key in {(0x3060, 0), (0x3061, 0), (0x3062, 0)}:
+            ch = {0x3060: "R", 0x3061: "G", 0x3062: "B"}[entry.key[0]]
+            try:
+                self._led_on_read(ch, int(res["raw"]))
+            except (KeyError, TypeError, ValueError):
+                pass
         if res.get("ok"):
             text = entry.format_value(res["raw"])
             if item:
@@ -1585,7 +1982,8 @@ class MainWindow(QMainWindow):
 
     def _load_default_map(self) -> None:
         preferred = ["position_actual", "velocity_actual", "torque_actual",
-                     "tlm_vel_demand_rad_s", "tlm_vel_actual_rad_s", "tlm_iq_meas_a"]
+                     "tlm_vel_demand_rad_s", "tlm_vel_actual_rad_s", "tlm_iq_meas_a",
+                     "tlm_i_arm_a"]   # brushed measured current -> Motor Config live readout
         chosen = [self.od.by_name[n] for n in preferred
                   if n in self.od.by_name and self.od.by_name[n].is_pdo]
         self._clear_map()
@@ -1663,15 +2061,38 @@ class MainWindow(QMainWindow):
                 item = self.item_by_key.get(entry.key)
                 if item is not None:
                     self._set_value_cell(item, entry.format_value(entry.si_to_raw(value)))
+        # Motor Config measured-current readout: from the telemetry stream (not polled).
+        i_arm = s.values.get("tlm_i_arm_a")
+        if i_arm is not None:
+            self.mcfg_cur_lbl.setText(f"{i_arm:.3f} A")
 
     # === graphing =============================================================
     def _new_graph(self, initial: list[str] | None = None) -> GraphWindow:
         if initial is None:
             initial = self._watched_names()  # default: graph what you've ticked as Watch
-        gw = GraphWindow(self.buffer, self._available_channels(), initial=initial, parent=self)
+        # parent=None makes the graph a TRULY independent top-level window —
+        # minimizing it doesn't minimize MainWindow, and minimizing MainWindow
+        # doesn't minimize the graph. With parent=self Qt treats it as a
+        # "secondary window" of the parent and ties their window-states.
+        # We still keep a reference in self.graph_windows to (a) keep it alive
+        # against garbage collection and (b) close it explicitly when MainWindow
+        # closes — otherwise the Python process keeps running with orphan
+        # graph windows after the main UI is gone.
+        gw = GraphWindow(self.buffer, self._available_channels(), initial=initial, parent=None)
         gw.show()
         self.graph_windows.append(gw)
         return gw
+
+    def closeEvent(self, event) -> None:
+        # Close all detached graph windows so the app actually exits when
+        # MainWindow closes (otherwise their event loops keep Python alive).
+        for gw in list(self.graph_windows):
+            try:
+                gw.close()
+            except RuntimeError:
+                pass  # already deleted
+        self.graph_windows.clear()
+        super().closeEvent(event)
 
     # === context menu / filter ===============================================
     def _tree_menu(self, pos) -> None:

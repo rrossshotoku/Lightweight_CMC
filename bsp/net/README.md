@@ -11,8 +11,9 @@ Socket-like API on top of the WIZnet W6100. Hides the chip-specific calls behind
   | Socket | Purpose | Layer |
   |---:|---|---|
   | 0 | UDP — CAMERAD poll listen, port 30002 | `controller_mgr` |
-  | 1 | TCP — CAMERAD listen, port 30003 | `controller_mgr` |
-  | 2..3 | TCP — per-controller (in or out) | `controller_mgr` |
+  | 1 | TCP — CAMERAD listen, port 30001 (matches SW050 LISTENPORT1) | `controller_mgr` |
+  | 2 | TCP — controller A outbound | `controller_mgr` |
+  | 3 | TCP — controller B outbound (**RESERVED**, unallocated in code today but must stay reserved for Phase B 1×S + 1×T deployment — do NOT assign to anything else, e.g. a future bootloader; see `Documentation/dual_bootloader_design.md` §5.0) | `controller_mgr` (future) |
   | 4 | UDP — OD access, port **5000** (per `Interface/NETWORK_UDP_SPEC.md`) | `od` |
   | 5 | UDP — OD telemetry stream, port **5001** | `od` |
   | 6 | TCP — log socket, port 30200 | `log` |

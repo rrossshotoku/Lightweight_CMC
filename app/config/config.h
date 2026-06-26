@@ -27,7 +27,7 @@ typedef struct {
     uint8_t  netmask[4];
     uint8_t  gateway[4];
     uint16_t udp_poll_port;       /* CAMERAD poll, default 30002 */
-    uint16_t tcp_camerad_port;    /* CAMERAD TCP listen, default 30003 */
+    uint16_t tcp_camerad_port;    /* CAMERAD TCP listen, default 30001 (matches SW050 LISTENPORT1) */
     uint16_t http_port;           /* default 80 */
     uint16_t od_udp_port;         /* OD access UDP, default 5000 per Interface/NETWORK_UDP_SPEC.md.
                                    * Telemetry sits at od_udp_port + 1 (= 5001 by default). */

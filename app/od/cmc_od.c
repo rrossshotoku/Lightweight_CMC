@@ -13,6 +13,7 @@
 
 #include "app/axis_manager/axis_manager.h"
 #include "app/cmc_state/cmc_state.h"
+#include "app/led_indicator/led_indicator.h"
 #include "app/log/log.h"
 
 #include <string.h>
@@ -162,6 +163,20 @@ MC_IfOdResult_t cmc_od_read(uint16_t idx, uint8_t sub,
     case 0x3051:                /* cmc_save_shots */
         return MC_IF_OD_ERR_ACCESS;
 
+    /* --- 0x3060-0x3062 RGB status LED colour --- */
+    case 0x3060: {
+        out_data[0] = led_indicator_get_r();
+        *out_type = MC_IF_T_U8; *out_len = 1; return MC_IF_OD_OK;
+    }
+    case 0x3061: {
+        out_data[0] = led_indicator_get_g();
+        *out_type = MC_IF_T_U8; *out_len = 1; return MC_IF_OD_OK;
+    }
+    case 0x3062: {
+        out_data[0] = led_indicator_get_b();
+        *out_type = MC_IF_T_U8; *out_len = 1; return MC_IF_OD_OK;
+    }
+
     default:
         return MC_IF_OD_ERR_NO_OBJECT;
     }
@@ -222,6 +237,9 @@ static bool is_loggable_write(uint16_t idx)
     case 0x3033:  /* axis_accel_limit              */
     case 0x3050:  /* cmc_save_config trigger       */
     case 0x3051:  /* cmc_save_shots trigger        */
+    case 0x3060:  /* led_color_r                   */
+    case 0x3061:  /* led_color_g                   */
+    case 0x3062:  /* led_color_b                   */
         return true;
     default:
         return false;
@@ -381,6 +399,20 @@ static MC_IfOdResult_t cmc_od_write_inner(uint16_t idx, uint8_t sub,
         if (get_u16(in_data) != MC_IF_SAVE_MAGIC) return MC_IF_OD_ERR_RANGE;
         return cmc_state_save_shots() ? MC_IF_OD_OK
                                       : MC_IF_OD_ERR_CALLBACK;
+
+    /* --- 0x3060/61/62 RGB status LED colour --- */
+    case 0x3060:
+        sz = check_write_size(MC_IF_T_U8, in_len); if (sz != MC_IF_OD_OK) return sz;
+        if (in_type != MC_IF_T_U8) return MC_IF_OD_ERR_TYPE;
+        WRITE_OK_OR(led_indicator_set_r(in_data[0]));
+    case 0x3061:
+        sz = check_write_size(MC_IF_T_U8, in_len); if (sz != MC_IF_OD_OK) return sz;
+        if (in_type != MC_IF_T_U8) return MC_IF_OD_ERR_TYPE;
+        WRITE_OK_OR(led_indicator_set_g(in_data[0]));
+    case 0x3062:
+        sz = check_write_size(MC_IF_T_U8, in_len); if (sz != MC_IF_OD_OK) return sz;
+        if (in_type != MC_IF_T_U8) return MC_IF_OD_ERR_TYPE;
+        WRITE_OK_OR(led_indicator_set_b(in_data[0]));
 
     default:
         return MC_IF_OD_ERR_NO_OBJECT;

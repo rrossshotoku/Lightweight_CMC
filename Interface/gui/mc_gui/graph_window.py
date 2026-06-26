@@ -41,8 +41,19 @@ class GraphWindow(QWidget):
         GraphWindow._counter += 1
         self.setWindowTitle(f"Live Graph {GraphWindow._counter}")
         self.resize(900, 560)
-        # top-level pop-out window even though it has a parent (so it stays grouped)
-        self.setWindowFlag(Qt.WindowType.Window, True)
+        # Independent top-level window with full title-bar controls so the
+        # operator can minimize / maximize / close it without affecting the
+        # main app (MainWindow passes parent=None for full independence —
+        # we still set the flag to keep behaviour correct if the constructor
+        # is ever called with a parent during tests). MinimizeButtonHint +
+        # MaximizeButtonHint make the controls explicit; on some Qt styles
+        # the minimize button is hidden by default for non-QMainWindow tops.
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
 
         self.buffer = buffer
         self.curves: dict[str, pg.PlotDataItem] = {}
@@ -98,7 +109,11 @@ class GraphWindow(QWidget):
         bar.addWidget(self.window_s)
 
         btn_yauto = QPushButton("Y auto")
-        btn_yauto.clicked.connect(lambda: self.plot.enableAutoRange(axis="y"))
+        btn_yauto.setToolTip(
+            "Refit the Y axis to currently visible data and keep it auto-fitting "
+            "as new samples arrive. Mouse-zoom or mouse-pan on Y disables the "
+            "auto-fit again until you click this.")
+        btn_yauto.clicked.connect(self._y_auto)
         bar.addWidget(btn_yauto)
 
         btn_clear = QPushButton("Clear")
@@ -201,10 +216,42 @@ class GraphWindow(QWidget):
             self.plot.enableAutoRange(axis="y")
         self._dirty = True
 
-    def _on_manual_range(self) -> None:
-        self._dirty = True  # user panned/zoomed -> refresh the visible slice
-        if self.autoscroll:
-            self.chk_autoscroll.setChecked(False)  # also sets self.autoscroll via signal
+    def _on_manual_range(self, *args) -> None:
+        """User panned/zoomed with the mouse. Never disables autoscroll —
+        mouse interaction is an inspection gesture, not a control input.
+
+        Autoscroll only turns off via the explicit checkbox. When it's on,
+        the redraw loop keeps snapping X back to (latest - window) every
+        new sample, so any manual pan you do is visible until the next
+        data tick. Mouse Y zoom/pan still works freely; X mouse-pan looks
+        like a brief flick before autoscroll re-asserts on the next sample.
+        For a sustained look-back, un-tick "Auto-scroll" first.
+
+        (Previously this handler unchecked autoscroll on any mouse change,
+        which made the live view "stick" after a single accidental scroll.)
+        """
+        self._dirty = True
+        _ = args  # mask not consulted any more
+
+    def _y_auto(self) -> None:
+        """Refit Y to currently visible data and keep auto-fitting going forward.
+
+        Does BOTH enableAutoRange (so subsequent setData calls refit) AND
+        an explicit autoRange call (force an immediate refit even when the
+        data hasn't moved — mouse-pan can leave the ViewBox in a stale
+        manual range that enableAutoRange alone doesn't visibly correct
+        until the next data tick). Without both, the button was a no-op
+        in the steady-state-no-new-data case.
+        """
+        vb = self.plot.getViewBox()
+        try:
+            vb.enableAutoRange(axis=vb.YAxis, enable=True)
+            vb.updateAutoRange()
+        except Exception:
+            # Fallback for older pyqtgraph variants
+            self.plot.enableAutoRange(axis="y")
+            self.plot.autoRange()
+        self._dirty = True
 
     # --- time markers (measure Δt between two points) -------------------------
     def _add_marker(self) -> None:

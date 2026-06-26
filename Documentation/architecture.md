@@ -76,7 +76,9 @@ Flash budget (rough):
 ```
                          ┌───────────────────────────────┐
                          │  S-type or T-type panel       │
-                         │  (multiple, up to 3 connected)│
+                         │  (multiple discovered via UDP │
+                         │  POLL; ONE active TCP session │
+                         │  at a time — see §3.1)        │
                          └─────────────┬─────────────────┘
                                        │ CAMERAD over UDP+TCP
                                        │
@@ -130,10 +132,45 @@ Five external interfaces, all over the same Ethernet port:
 | Interface | Transport | Default port | Purpose |
 |---|---|---:|---|
 | CAMERAD poll       | UDP        | 30002 | S/T panel discovery |
-| CAMERAD control    | TCP        | 30003 | Panel↔CMC commands & responses |
+| CAMERAD control    | TCP        | 30001 | Panel↔CMC commands & responses |
 | OD network port    | UDP (SDO)  | 30100 | Read/write OD entries from network tools |
 | Web UI             | TCP (HTTP) | 80    | Configuration & status pages |
 | Log stream         | TCP        | 30200 | Diagnostic output |
+
+### 3.1. Multi-panel concurrency (CAMERAD inbound TCP — known constraint)
+
+The W6100 has 8 hardware sockets. A single TCP slot can be either **LISTEN**
+**or** **ESTABLISHED**, not both — there is no `accept()` that spawns a fresh
+socket per connection like a Unix server. So **one listen slot on port 30001
+serves exactly one active inbound TCP session at a time.** A second panel that
+tries to TCP-connect while the first is ESTABLISHED is RST'd by the W6100.
+
+What this means in practice for multi-panel deployments:
+
+- **UDP POLL discovery scales freely** — slot 0 is connectionless and sees
+  every panel's POLLs (`controller_mgr` tracks each as a separate controller).
+- **Outbound TCP scales to two** — slot 2 (`CTRL_A_TCP_SOCKET`) carries
+  responses back to whichever panel just polled, with slot 3
+  (`CTRL_B_TCP_SOCKET`) reserved for a second concurrent push channel.
+- **Inbound TCP is shared / serialised** — the CAMERAD SELECT/GRAB ownership
+  model is what makes this work: panels that hold SELECT/GRAB ownership send
+  commands inbound on the listen slot; non-owners stay POLL-only and don't
+  fight for the listen slot. The handover happens at SELECT/DESELECT/GRAB
+  boundaries, not at TCP-connection boundaries.
+- **A "permanently TCP-connected, but un-selected, second panel" is not
+  supported** by the current socket map. It would require either a second
+  listen port (CAMERAD doesn't specify one) or a different transport for
+  inbound commands.
+
+Slot 3 is **reserved** for the controller B outbound TCP — `controller_mgr.c`
+documents this and `bsp/net/README.md` enforces it via the socket map. The
+slot 3 reservation does NOT solve the inbound-listen problem; it only buys a
+second push channel.
+
+If two-panel concurrent operation needs to evolve beyond "POLL both, command
+the selected one", the design decision belongs to whoever owns the CAMERAD
+protocol surface — until then, the SELECT/GRAB serialisation is the
+operational model.
 
 ---
 
@@ -453,7 +490,7 @@ W6100 has 8 hardware sockets. Compile-time map (see also `bsp/net/README.md`):
 | Socket | Type | Port (default) | Owner | Purpose |
 |---:|---|---:|---|---|
 | 0 | UDP | 30002 | `controller_mgr` | CAMERAD poll listen |
-| 1 | TCP listen | 30003 | `controller_mgr` | CAMERAD TCP listen |
+| 1 | TCP listen | 30001 | `controller_mgr` | CAMERAD TCP listen |
 | 2 | TCP | dynamic | `controller_mgr` | Per-controller (in or out) |
 | 3 | TCP | dynamic | `controller_mgr` | Per-controller (in or out) |
 | 4 | UDP | **5000** | `od` | OD access (PC ↔ CMC, see `Interface/NETWORK_UDP_SPEC.md`) |

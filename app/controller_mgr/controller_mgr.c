@@ -5,13 +5,13 @@
  * Three sockets active:
  *   - UDP listen socket on udp_poll_port (30002) — receives POLL discovery
  *     broadcasts from controllers. (app_init.c:97-103)
- *   - TCP listen socket on tcp_camerad_port (30003) — accepts inbound TCP
- *     from the controller. The panel uses this for command messages
- *     (SELECT / KEYPRESS / MOVEMENT). (app_init.c:106-112)
+ *   - TCP listen socket on tcp_camerad_port (30001 — SW050 LISTENPORT1) —
+ *     accepts inbound TCP from the controller. The panel uses this for
+ *     command messages (SELECT / KEYPRESS / MOVEMENT). (app_init.c:106-112)
  *   - One outbound TCP socket per controller — opened on first POLL,
- *     connects from CMC to controller's return_port (30001). All
- *     responses (POLL response + others) flow over this socket.
- *     (command_handler.c::ensure_controller_connection)
+ *     connects from CMC to controller's return_port (typically 30001 on
+ *     the panel side). All responses (POLL response + others) flow over
+ *     this socket. (command_handler.c::ensure_controller_connection)
  *
  * Sequence (mirroring command_handler.c::cmd_handle_poll line 110-154):
  *   1. POLL UDP arrives.
@@ -865,7 +865,7 @@ void controller_mgr_init(void)
 
     const network_cfg_t *cfg = config_get_network();
     uint16_t udp_port = (cfg->udp_poll_port    != 0) ? cfg->udp_poll_port    : 30002u;
-    uint16_t tcp_port = (cfg->tcp_camerad_port != 0) ? cfg->tcp_camerad_port : 30003u;
+    uint16_t tcp_port = (cfg->tcp_camerad_port != 0) ? cfg->tcp_camerad_port : 30001u;
 
     if (!net_open(POLL_SOCKET, NET_PROTO_UDP, udp_port, false)) {
         LOG_ERROR("ctrl_mgr: failed to open POLL UDP %u", (unsigned)udp_port);

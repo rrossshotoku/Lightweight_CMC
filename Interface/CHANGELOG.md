@@ -23,6 +23,53 @@ This is the **authoritative change history** for the shared inter-MCU boundary c
 
 ---
 
+## [4.6.0] - 2026-06-26  (wire-breaking? no — additive: CMC RGB status LED)
+
+CMC-only addition. The on-board RGB LED (PC0/PC1/PC2 → TIM1_CH1/2/3 PWM) is now driven by an `app/led_indicator` state machine with operator-tunable colour. Patterns: solid-on at boot for 3 s; 3-flash on network-link-up; breathing (1 s up + 1 s down, triangular ramp) while motor reports moving; solid otherwise. No motor MCU change, no `MC_IF_PROTOCOL_VERSION` bump.
+
+### Added (OD entries)
+- `0x3060 led_color_r`, `0x3061 led_color_g`, `0x3062 led_color_b` (U8 RW PERSIST, `MC_IF_OWNER_CMC`). Magnitude 0–255 per channel. Default magenta (128, 0, 128) so an unconfigured unit is visibly alive on first boot.
+
+### Persist
+- LED colour rides the axis_persist blob — `AXIS_PERSIST_VERSION` bumped **3 → 4**. The CONFIG persist region is the only one with layout headroom (other regions are at fixed-size structs); rather than spin up a 4th persist region for 3 bytes, the axis blob co-locates it. Boards with v3 blob in flash fall through to coded defaults on first boot after this change.
+
+### Consumers to update
+- **motor-control MCU**: nothing — CMC-owned entry.
+- **network MCU** (this project): implemented — new `bsp/leds/` (TIM1 PWM wrapper), new `app/led_indicator/` (state machine), `cmc_od` dispatches `0x3060/61/62`, persist co-located in axis blob.
+- **PC tool**: implemented — "Indicator LED" section in the Motor Config tab with R/G/B sliders, live colour swatch, "Read LED" + "Save to flash" buttons. New entries auto-appear in the OD browser via the X-macro parser.
+
+---
+
+## [4.5.0] - 2026-06-26  (wire-breaking? no — additive + access change: backend select, current tuning, R/L→derived gains)
+
+Motor-owned additions for the brushed-DC backend (ADR-039) and current-loop tuning (ADR-030).
+
+### Added (OD entry)
+- **`0x2000:6 motor_backend_sel`** (U8, RW, PERSIST, motor-owned): drive backend — `0` = BLDC/PMSM FOC (3-shunt), `1` = brushed-DC H-bridge. Per-board; the motor reads it **once at boot** to pick the dispatch path and the current-sense ADC channel, so a change takes effect on **save + reboot**.
+- **`0x2400:8 hb_cur_bandwidth`** (F32, RW, PERSIST, motor-owned): brushed current-loop bandwidth ωc [rad/s]. With **`0x2000:3/4 motor_resistance / motor_inductance`** (now *applied config* — no longer mirrored from the model, so writes stick), the motor **derives** the PI gains `kp = ωc·L, ki = ωc·R`.
+- **`0x2410:6 tlm_i_arm_a`** (F32, RO, PDO, motor-owned): measured armature current — live Motor-Config readout + graphable.
+- **`0x2600:4/5 max_velocity_rad_s / max_accel_rad_s2`** (F32, RW, PERSIST, motor-owned): the motor's **enforced** motion envelope (ADR-040). The motor clamps every move + the velocity demand to these regardless of the CMC's requested profile (`0x6081/3/4`). `0` = disabled (default; set per-board).
+- **`0x2600:6/7 pos_limit_lo_rad / pos_limit_hi_rad`** (F32, RW, PERSIST, motor-owned): **manually-set** soft position limits (home-relative rad, like `0x6064`). The motor clamps move targets, stops the velocity demand at them, and sets the `AT_LIMIT_LO/HI` movement-status bits. `lo >= hi` = disabled (default). Independent of homing.
+- **`0x2300:6/7 vel_accel_up / vel_accel_dn`** (F32, RW, PERSIST, motor-owned): velocity-demand **acceleration ramp** (slew-rate limiter, ADR-042) — slews the PROFILE_VELOCITY (joystick) demand toward the setpoint at this acceleration and stops there; `accel_up` while speeding up, `accel_dn` while slowing down [rad/s²]. `0` = disabled (default). The position cascade + tuning generator bypass it.
+
+### Changed (access)
+- **`0x2400:6/7 hb_cur_kp / hb_cur_ki`** RW PERSIST → **RO** (no longer persisted): they are now the **derived** gains (from R/L + bandwidth), read-only readback only. Set R/L/ωc instead of the gains directly. Not wire-breaking (same index/type; access metadata).
+
+### Fixed
+- **Observer gains now live from the OD.** `est_obs_kp/ki/kv` + `est_use_observer` (`0x2500:3-6`) were watch-window-only (mirror-trapped: GUI writes were overwritten each tick and never applied). The motor now applies them from the OD (GUI Motor Config, PERSIST). `est_electrical_offset` (`0x2500:1`) is a calibration result — dropped from the editable Motor-Config page (shown via cal status). No wire change.
+
+### Added (define)
+- **`MC_IF_TEST_MODE_CURRENT (3)`**: loop-tuning `test_mode` (0x2910:1) value — the on-motor signal generator drives the **current/torque command** (`test_amplitude` in amps; rate 0 → a step pulse; needs TORQUE mode). Joins OFF/VELOCITY/POSITION.
+
+No `MC_IF_PROTOCOL_VERSION` bump (additive, non-PDO).
+
+### Consumers to update
+- motor-control MCU: implemented — reads `0x2000:6` at boot → backend + ADC channel; `test_mode=3` → current-loop reference. Build fw 44.
+- network MCU: none — forwards both (motor-owned).
+- PC tool: BLDC/Brushed-DC selector (writes `0x2000:6`, prompts save+reboot) + "Current tuning" in the tuning panel.
+
+---
+
 ## [4.4.0] - 2026-06-25  (wire-breaking? no — additive: on-board UP/DOWN button current jog)
 
 CMC-only addition. While `AXIS_OP_MODE_TORQUE` is active, the network MCU's on-board UP_BUTTON / DOWN_BUTTON (PB2 / PB1) drive `target_current` (0x302B): UP held → `+axis_button_current`, DOWN held → `−axis_button_current`, released → 0. Lets the firmware author bench-test the torque loop without PC-tool interaction. No motor MCU change, no `MC_IF_PROTOCOL_VERSION` bump.

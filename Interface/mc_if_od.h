@@ -137,6 +137,7 @@ typedef enum
 #define MC_IF_TEST_MODE_OFF        (0u)   /* normal operation                                              */
 #define MC_IF_TEST_MODE_VELOCITY   (1u)   /* generator -> velocity-loop demand (needs PROFILE_VELOCITY)    */
 #define MC_IF_TEST_MODE_POSITION   (2u)   /* generator -> position demand, bypass trajectory (PROFILE_POSITION) */
+#define MC_IF_TEST_MODE_CURRENT    (3u)   /* generator -> current/torque command (needs TORQUE mode)        */
 
 /* ===== Telemetry (TX-PDO) map: 0x2A00 =====
  * Host-configurable list of OD entries streamed in the cyclic telemetry frame. The map is an
@@ -215,6 +216,8 @@ typedef enum
     X(0x2000, 3, motor_resistance_ohm,        MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2000, 4, motor_inductance_h,          MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2000, 5, motor_pole_pairs,            MC_IF_T_U16, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    /* Drive backend (per-board, applied at boot, ADR-039): 0 = BLDC/PMSM FOC 3-shunt, 1 = brushed-DC H-bridge. */ \
+    X(0x2000, 6, motor_backend_sel,           MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     /* --- 0x2200 position controller --- */ \
     X(0x2200, 1, pos_kp,                      MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2200, 2, pos_ki,                      MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
@@ -226,6 +229,10 @@ typedef enum
     X(0x2300, 3, vel_kd,                      MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2300, 4, vel_current_limit_a,         MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2300, 5, vel_load_factor,             MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    /* Velocity-demand acceleration ramp (ADR-042): slew the PROFILE_VELOCITY (joystick) demand toward the \
+       setpoint at this acceleration. accel_up while speeding up, accel_dn while slowing down [rad/s^2]. 0 = off. */ \
+    X(0x2300, 6, vel_accel_up,                MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    X(0x2300, 7, vel_accel_dn,                MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2310, 1, tlm_vel_demand_rad_s,        MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2310, 2, tlm_vel_actual_rad_s,        MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2310, 3, tlm_vel_iq_cmd_a,            MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
@@ -235,11 +242,17 @@ typedef enum
     X(0x2400, 3, foc_iq_kp,                   MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2400, 4, foc_iq_ki,                   MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2400, 5, foc_voltage_limit_v,         MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    /* Brushed-DC armature-current PI (ADR-039): set motor R (0x2000:3), L (0x2000:4) + bandwidth (:8); \
+       the motor DERIVES the gains kp = wc*L, ki = wc*R and reports them read-only at :6/:7. */ \
+    X(0x2400, 6, hb_cur_kp,                   MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    X(0x2400, 7, hb_cur_ki,                   MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    X(0x2400, 8, hb_cur_bandwidth,            MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2410, 1, tlm_id_meas_a,               MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2410, 2, tlm_iq_meas_a,               MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2410, 3, tlm_vd_v,                    MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2410, 4, tlm_vq_v,                    MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2410, 5, tlm_electrical_angle_rad,    MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
+    X(0x2410, 6, tlm_i_arm_a,                 MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     /* --- 0x2500 encoder / state estimator + telemetry --- */ \
     X(0x2500, 1, est_electrical_offset_rad,   MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2500, 2, est_velocity_filter_hz,      MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
@@ -254,6 +267,14 @@ typedef enum
     X(0x2600, 1, fault_flags,                 MC_IF_T_U32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2600, 2, current_trip_a,              MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2600, 3, tlm_bus_voltage_v,           MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
+    /* Motor-owned, enforced motion envelope (ADR-040): the motor clamps every move + the velocity \
+       demand to these, regardless of the CMC's requested profile (0x6081/3/4). 0 = disabled. */ \
+    X(0x2600, 4, max_velocity_rad_s,          MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    X(0x2600, 5, max_accel_rad_s2,            MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    /* Soft position limits (ADR-040): manually set (home-relative rad, like 0x6064); the motor clamps move \
+       targets + stops the velocity demand at them + sets AT_LIMIT_LO/HI. lo >= hi = disabled. */ \
+    X(0x2600, 6, pos_limit_lo_rad,            MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    X(0x2600, 7, pos_limit_hi_rad,            MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     /* --- 0x2700 calibration --- */ \
     X(0x2700, 1, cal_command,                 MC_IF_T_U16, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     X(0x2700, 2, cal_status,                  MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
@@ -335,6 +356,14 @@ typedef enum
     /* to the CMC's internal flash. Same magic constant used by the motor   */ \
     /* MCU's 0x2800:1 save_command; this is the CMC-side equivalent.        */ \
     X(0x3050, 0, cmc_save_config,             MC_IF_T_U16, MC_IF_A_WO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
-    X(0x3051, 0, cmc_save_shots,              MC_IF_T_U16, MC_IF_A_WO, MC_IF_F_NONE,    MC_IF_OWNER_CMC)
+    X(0x3051, 0, cmc_save_shots,              MC_IF_T_U16, MC_IF_A_WO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
+    /* --- 0x3060-0x306F CMC on-board RGB status LED (PC0/PC1/PC2 = TIM1_CH1/2/3) --- */ \
+    /* Operator-tunable indicator colour. led_indicator drives the pattern (boot      */ \
+    /* solid, network-link flash 3x, breathing while motor moving, idle solid); the   */ \
+    /* configured colour below is what the pattern modulates. Saved with cmc_save_    */ \
+    /* config (rides the axis_persist blob — AXIS_PERSIST_VERSION bumped 3 -> 4).    */ \
+    X(0x3060, 0, led_color_r,                 MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_CMC) \
+    X(0x3061, 0, led_color_g,                 MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_CMC) \
+    X(0x3062, 0, led_color_b,                 MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_CMC)
 
 #endif /* MC_IF_OD_H */

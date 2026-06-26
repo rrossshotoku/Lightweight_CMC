@@ -19,15 +19,11 @@
 #include "axis_manager.h"
 
 #include "app/cia402/cia402.h"
+#include "app/led_indicator/led_indicator.h"  /* persist-blob co-tenant */
 #include "app/log/log.h"
 #include "app/persist/persist.h"
+#include "bsp/buttons/buttons.h"   /* on-board UP/DOWN button reads (debounced) */
 #include "bsp/time/time.h"
-
-/* For the on-board UP_BUTTON / DOWN_BUTTON GPIO reads used by
- * poll_torque_buttons (only effective when op_mode_actual = TORQUE).
- * CubeMX-generated defines live in Core/Inc/main.h. */
-#include "stm32g4xx_hal.h"
-#include "main.h"
 
 #include <string.h>
 #include <math.h>
@@ -305,8 +301,13 @@ static float current_velocity_demand_rad_s(void)
 /* v3 (2026-06-25): removed payload_weight_kg — the operator-tunable load
  * concept moved to motor-owned 0x2300:5 vel_load_factor (REQ-0014). Boards
  * with a v2 blob in flash get rejected by persist_load (version mismatch)
- * and fall through to coded defaults — operator needs to re-Save to migrate. */
-#define AXIS_PERSIST_VERSION   3u
+ * and fall through to coded defaults — operator needs to re-Save to migrate.
+ *
+ * v4 (2026-06-26): appended 3 bytes of LED indicator colour (R/G/B) — see
+ * app/led_indicator. The blob remains operator-tunables only; we co-locate
+ * here rather than spinning up a 4th persist region for 3 bytes (the
+ * existing CONFIG region is the only one with spare layout headroom). */
+#define AXIS_PERSIST_VERSION   4u
 
 typedef struct __attribute__((packed)) {
     float    joystick_max_velocity;
@@ -318,6 +319,7 @@ typedef struct __attribute__((packed)) {
     float    position_limit_lo_rad;
     float    position_limit_hi_rad;
     float    accel_limit_rad_s2;
+    uint8_t  led_rgb[3];                 /* v4: led_indicator colour */
 } axis_persist_blob_t;
 
 static void apply_persist_blob(const axis_persist_blob_t *b)
@@ -331,6 +333,7 @@ static void apply_persist_blob(const axis_persist_blob_t *b)
     s_axis.position_limit_lo_rad = b->position_limit_lo_rad;
     s_axis.position_limit_hi_rad = b->position_limit_hi_rad;
     s_axis.accel_limit_rad_s2    = b->accel_limit_rad_s2;
+    led_indicator_apply_persist(b->led_rgb);
 }
 
 static void capture_persist_blob(axis_persist_blob_t *b)
@@ -344,6 +347,7 @@ static void capture_persist_blob(axis_persist_blob_t *b)
     b->position_limit_lo_rad = s_axis.position_limit_lo_rad;
     b->position_limit_hi_rad = s_axis.position_limit_hi_rad;
     b->accel_limit_rad_s2    = s_axis.accel_limit_rad_s2;
+    led_indicator_capture_persist(b->led_rgb);
 }
 
 bool axis_manager_save_to_flash(void)
@@ -733,41 +737,25 @@ static void compose_cyclic_cmd(MC_IfCyclicCommand_t *out)
 static void poll_load_factor_sdo(void);
 
 /*----------------------------------------------------------------------------
- * On-board UP/DOWN button polling — TORQUE-mode current jog
+ * TORQUE-mode current jog from on-board UP/DOWN buttons
  *
- * Both buttons are PB1 / PB2 with pull-downs configured in CubeMX, so a press
- * reads HIGH (GPIO_PIN_SET). While AXIS_OP_MODE_TORQUE is active we override
- * target_current_a from the (signed) button state; on release we zero it.
- *
- * Debounce: a button is considered "held" after BUTTON_DEBOUNCE_TICKS
- * consecutive HIGH reads and "released" after BUTTON_DEBOUNCE_TICKS LOW reads.
- * Counters saturate at BUTTON_DEBOUNCE_TICKS so a long hold doesn't overflow.
- * At a 1 ms tick rate the debounce window is ~3 ms — imperceptible to a human
- * but kills mechanical-bounce chatter that would otherwise queue redundant
- * SDO writes to 0x6071 during the bounce.
+ * Reads debounced button state from bsp/buttons (GPIO + debounce live there,
+ * NOT here — keeps app/ off the HAL). While AXIS_OP_MODE_TORQUE is active we
+ * override target_current_a from the (signed) button state; on release we
+ * zero it.
  *
  * Ownership model: PC-tool writes to 0x302B target_current still take effect
  * when neither button has been pressed. Once a button transitions to held,
  * the buttons take ownership and drive target_current each tick until BOTH
  * are released, at which point we zero target_current (one-shot) and release
- * ownership. The next PC-tool write then passes through normally. *---------------------------------------------------------------------------*/
-#define BUTTON_DEBOUNCE_TICKS  3u
-
-static uint8_t s_up_filter;          /* counts consecutive HIGH samples, saturates at DEBOUNCE_TICKS */
-static uint8_t s_down_filter;
-static bool    s_up_held;            /* debounced "currently held" */
-static bool    s_down_held;
-static bool    s_buttons_own_current;/* true while CMC is driving target_current from buttons */
+ * ownership. The next PC-tool write then passes through normally.
+ *---------------------------------------------------------------------------*/
+static bool s_buttons_own_current;   /* true while CMC is driving target_current from buttons */
 
 static void poll_torque_buttons(void)
 {
-    /* Debounce — sample, accumulate, saturate. */
-    bool up_now   = (HAL_GPIO_ReadPin(UP_BUTTON_GPIO_Port,   UP_BUTTON_Pin)   == GPIO_PIN_SET);
-    bool down_now = (HAL_GPIO_ReadPin(DOWN_BUTTON_GPIO_Port, DOWN_BUTTON_Pin) == GPIO_PIN_SET);
-    s_up_filter   = up_now   ? (uint8_t)((s_up_filter   < BUTTON_DEBOUNCE_TICKS) ? s_up_filter   + 1u : BUTTON_DEBOUNCE_TICKS) : 0u;
-    s_down_filter = down_now ? (uint8_t)((s_down_filter < BUTTON_DEBOUNCE_TICKS) ? s_down_filter + 1u : BUTTON_DEBOUNCE_TICKS) : 0u;
-    s_up_held     = (s_up_filter   >= BUTTON_DEBOUNCE_TICKS);
-    s_down_held   = (s_down_filter >= BUTTON_DEBOUNCE_TICKS);
+    bool up_held   = bsp_buttons_up_pressed();
+    bool down_held = bsp_buttons_down_pressed();
 
     /* Outside TORQUE mode the buttons do nothing (and we release ownership
      * if we held it, restoring write-through for the next mode-switch). */
@@ -779,18 +767,18 @@ static void poll_torque_buttons(void)
         return;
     }
 
-    bool any_held = s_up_held || s_down_held;
+    bool any_held = up_held || down_held;
     if (any_held) {
         /* Both held simultaneously -> safety zero (the operator's hand
          * likely slipped onto both; refuse to pick a direction). */
         float new_current;
-        if (s_up_held && s_down_held)         new_current = 0.0f;
-        else if (s_up_held)                    new_current = +s_axis.button_current_a;
-        else                                    new_current = -s_axis.button_current_a;
+        if (up_held && down_held)  new_current = 0.0f;
+        else if (up_held)          new_current = +s_axis.button_current_a;
+        else                        new_current = -s_axis.button_current_a;
 
         if (!s_buttons_own_current) {
             LOG_INFO("axis_manager: TORQUE button engaged %s -> target_current = %ld mA",
-                     (s_up_held && s_down_held) ? "BOTH" : (s_up_held ? "UP" : "DOWN"),
+                     (up_held && down_held) ? "BOTH" : (up_held ? "UP" : "DOWN"),
                      (long)lroundf(new_current * 1000.0f));
             s_buttons_own_current = true;
         }

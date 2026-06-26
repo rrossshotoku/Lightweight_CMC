@@ -48,18 +48,10 @@ static net_tcp_state_t map_sn_sr(uint8_t sr)
     }
 }
 
-static bool wait_phy_link(uint32_t timeout_ms)
-{
-    uint32_t start = time_ms();
-    while (wizphy_getphylink() != PHY_LINK_ON) {
-        if (time_elapsed_ms(start) > timeout_ms) return false;
-        /* IWDG must keep ticking — main_loop kicks it. We don't block
-         * here for longer than the IWDG period; the caller's outer
-         * loop will catch a hang. */
-        HAL_Delay(10);
-    }
-    return true;
-}
+/* (wait_phy_link removed — net_init used to block here for up to 3 s and
+ * return false on timeout, which left the chip unconfigured forever if
+ * the cable wasn't plugged in at boot. Init now always configures the
+ * chip's MAC/IP/sockets; PHY link is read live by net_link_up().) */
 
 /*----------------------------------------------------------------------------
  * Lifecycle
@@ -88,15 +80,17 @@ bool net_init(const uint8_t mac[6],
     uint8_t syslock = SYS_NET_LOCK;
     ctlwizchip(CW_SYS_UNLOCK, &syslock);
 
-    /* Wait for the PHY to come up. 3 s ceiling matches the reference. */
-    if (!wait_phy_link(3000)) {
-        LOG_ERROR("net: PHY link timeout (cable unplugged or PHY fault?)");
-        return false;
-    }
-    LOG_INFO("net: PHY link up");
-
-    /* Apply network info. The ioLibrary expects mutable wiz_NetInfo;
-     * we copy into a local because the API isn't const-correct. */
+    /* Apply network info BEFORE checking PHY link. MAC / IP / netmask /
+     * gateway are register writes that the W6100 accepts whether the
+     * cable is plugged in or not — they take effect on the wire as soon
+     * as the PHY link comes up later. Earlier code waited up to 3 s
+     * here for a link and then returned false on timeout, which is
+     * exactly the boot-with-cable-unplugged scenario: the chip stayed
+     * unconfigured forever, plugging the cable in afterward didn't
+     * recover because net_init was never called again.
+     *
+     * The ioLibrary expects mutable wiz_NetInfo; we copy into a local
+     * because the API isn't const-correct. */
     wiz_NetInfo ni = (wiz_NetInfo){ 0 };
     memcpy(ni.mac, mac,     6);
     memcpy(ni.ip,  ip,      4);
@@ -117,6 +111,16 @@ bool net_init(const uint8_t mac[6],
              netmask[0], netmask[1], netmask[2], netmask[3],
              gateway[0], gateway[1], gateway[2], gateway[3]);
 
+    /* Informational only — the cable may or may not be plugged in. We
+     * don't gate init on this; net_link_up() reports the live state and
+     * downstream consumers (log, web, controller_mgr, od) already handle
+     * the no-link case gracefully. */
+    if (wizphy_getphylink() == PHY_LINK_ON) {
+        LOG_INFO("net: PHY link up at boot");
+    } else {
+        LOG_INFO("net: PHY link down at boot (waiting for cable)");
+    }
+
     s_initialised = true;
     return true;
 }
@@ -124,7 +128,23 @@ bool net_init(const uint8_t mac[6],
 bool net_link_up(void)
 {
     if (!s_initialised) return false;
-    return wizphy_getphylink() == PHY_LINK_ON;
+    bool up = (wizphy_getphylink() == PHY_LINK_ON);
+
+    /* Edge-log link transitions. Lets the operator (and led_indicator,
+     * via its own polling) see exactly when the cable was plugged in /
+     * pulled out. Static prev tracks the last reported state — first
+     * call after boot reports a transition from whatever the init log
+     * line said, which is harmless. */
+    static bool s_prev_link;
+    static bool s_prev_valid;
+    if (!s_prev_valid || up != s_prev_link) {
+        if (s_prev_valid) {
+            LOG_INFO("net: PHY link %s", up ? "UP" : "DOWN");
+        }
+        s_prev_link  = up;
+        s_prev_valid = true;
+    }
+    return up;
 }
 
 /*----------------------------------------------------------------------------
