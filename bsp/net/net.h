@@ -78,6 +78,13 @@ bool net_link_up(void);
 
 bool net_open (net_sock_t sock, net_proto_t proto, uint16_t local_port, bool do_listen);
 void net_close(net_sock_t sock);
+/* Graceful TCP shutdown — sends FIN and returns immediately. Use instead
+ * of net_close() for sockets where pending TX bytes MUST flush to the
+ * wire (e.g. HTTP responses). The W6100 drains TX + completes FIN/ACK
+ * in the background; caller polls net_tcp_state() and reopens once
+ * SOCK_CLOSED. No-op on non-TCP / non-ESTABLISHED sockets (those fall
+ * back to a hard close). See net.c for the rationale. */
+void net_tcp_graceful_close(net_sock_t sock);
 
 /*----------------------------------------------------------------------------
  * TCP

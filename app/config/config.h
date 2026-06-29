@@ -27,7 +27,17 @@ typedef struct {
     uint8_t  netmask[4];
     uint8_t  gateway[4];
     uint16_t udp_poll_port;       /* CAMERAD poll, default 30002 */
-    uint16_t tcp_camerad_port;    /* CAMERAD TCP listen, default 30001 (matches SW050 LISTENPORT1) */
+    /* Two-panel IP-pinned routing: each slot has its own TCP listen port +
+     * an expected panel IP. POLL from panel_a_ip -> respond with panel_a_port;
+     * POLL from panel_b_ip -> respond with panel_b_port. Strict mode —
+     * panel_X_ip == 0.0.0.0 means "slot disabled, no listener opened, POLLs
+     * from any IP that doesn't match the OTHER slot are dropped". Slot A
+     * keeps the historical tcp_camerad_port field name for back-compat with
+     * existing call sites; slot B is brand-new. */
+    uint16_t tcp_camerad_port;    /* Panel A TCP listen, default 30001 (matches SW050 LISTENPORT1) — advertised as return_port in POLL responses to panel_a_ip */
+    uint8_t  panel_a_ip[4];       /* Expected source IP for panel A's POLLs; 0.0.0.0 = slot A disabled */
+    uint16_t panel_b_port;        /* Panel B TCP listen; 0 = slot B disabled */
+    uint8_t  panel_b_ip[4];       /* Expected source IP for panel B's POLLs; 0.0.0.0 = slot B disabled */
     uint16_t http_port;           /* default 80 */
     uint16_t od_udp_port;         /* OD access UDP, default 5000 per Interface/NETWORK_UDP_SPEC.md.
                                    * Telemetry sits at od_udp_port + 1 (= 5001 by default). */

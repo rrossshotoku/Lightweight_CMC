@@ -1,15 +1,16 @@
 """Main application window: OD browser, acyclic read/write, telemetry-map editor."""
 from __future__ import annotations
 
+import math
 import sys
 import time
 import traceback
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QColor
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton,
+    QHeaderView, QLabel, QLayout, QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton,
     QScrollArea, QSlider, QSpinBox, QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget,
 )
@@ -82,15 +83,78 @@ MC_TEST_MODE_CURRENT = 3
 
 # Command-page live readback uses the MOTOR actuals (the CMC's 0x3002/3 aren't populated yet) +
 # the CiA-402 statusword + the tuning generator's active flag (0x2910:7).
-_CMD_STATE_KEYS = [(0x3000, 0), (0x6041, 0), (0x6064, 0), (0x606C, 0), (0x6077, 0), (0x2910, 7)]
+_CMD_STATE_KEYS = [(0x3000, 0), (0x6041, 0), (0x6064, 0), (0x606C, 0), (0x6077, 0), (0x2910, 7),
+                   (0x2920, 8), (0x2920, 9)]  # + freq-sweep current freq / active (ADR-047)
 # Motor Config tab live readouts, also handled by _cmd_on_state_read (measured current, derived
 # brushed gains, configured backend). Routed to that handler but NOT command-state polled.
 _MCFG_READOUT_KEYS = [(0x2000, 6), (0x2410, 6), (0x2400, 6), (0x2400, 7), (0x3001, 0)]
+# Motor Command tab on-demand readouts (the accel-ramp "Read" button), routed to _cmd_on_state_read.
+_CMD_READOUT_KEYS = [(0x2300, 6), (0x2300, 7), (0x2300, 8)]   # accel ramp up / dn / jerk
 
 # OD tree columns
 _COLUMNS = ["Name", "Index:Sub", "Type", "Acc", "Owner", "Category", "Flags", "Value", "Unit", "Watch"]
 _VALUE_COL = 7
 _WATCH_COL = 9
+
+
+class _FlowLayout(QLayout):
+    """Lays items left-to-right, wrapping to a new row when the width runs out, so a toolbar-style
+    row never pins a large minimum window width. Trimmed from the Qt FlowLayout example."""
+
+    def __init__(self, parent=None, spacing=6):
+        super().__init__(parent)
+        self._items: list = []
+        self.setSpacing(spacing)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, i):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), apply=False)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, apply=True)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        s = QSize()
+        for it in self._items:
+            s = s.expandedTo(it.minimumSize())
+        m = self.contentsMargins()
+        return s + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _do_layout(self, rect, apply):
+        x, y, line_h = rect.x(), rect.y(), 0
+        sp = self.spacing()
+        for it in self._items:
+            hint = it.sizeHint()
+            if x + hint.width() > rect.right() and line_h > 0:
+                x = rect.x()
+                y += line_h + sp
+                line_h = 0
+            if apply:
+                it.setGeometry(QRect(QPoint(x, y), hint))
+            x += hint.width() + sp
+            line_h = max(line_h, hint.height())
+        return y + line_h - rect.y()
 
 
 class MainWindow(QMainWindow):
@@ -104,6 +168,8 @@ class MainWindow(QMainWindow):
         self.latest_sample: TelemetrySample | None = None
         self._probe_key: tuple[int, int] | None = None
         self._last_sample_time = 0.0
+        self._mcfg_vals: dict = {}      # latest read-back SI values, keyed (index,sub) -> for bandwidth estimates
+        self._bw_labels: dict = {}      # gains group title -> est-bandwidth QLabel
 
         self.setWindowTitle("CMC Object Dictionary Tool")
         self.resize(1280, 820)
@@ -160,7 +226,7 @@ class MainWindow(QMainWindow):
 
     def _build_connection_bar(self) -> QWidget:
         box = QGroupBox("Connection")
-        lay = QHBoxLayout(box)
+        lay = _FlowLayout(box)   # wraps to extra rows when narrow so it never pins the window width
         lay.addWidget(QLabel("CMC IP:"))
         self.ip_edit = QLineEdit("192.1.0.100")
         self.ip_edit.setMaximumWidth(140)
@@ -188,8 +254,6 @@ class MainWindow(QMainWindow):
         self.btn_connect = QPushButton("Connect")
         self.btn_connect.clicked.connect(self._toggle_connect)
         lay.addWidget(self.btn_connect)
-
-        lay.addStretch(1)
         self.lbl_status = QLabel("Disconnected")
         self.lbl_status.setStyleSheet("font-weight: bold;")
         lay.addWidget(self.lbl_status)
@@ -264,13 +328,24 @@ class MainWindow(QMainWindow):
             parts.append("PERSIST")
         return ",".join(parts)
 
+    def _scroll(self, widget: QWidget) -> QScrollArea:
+        """Wrap a tab panel in a scroll area so the window can shrink below the panel's natural
+        size — scrollbars appear instead of clamping the minimum window size."""
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setWidget(widget)
+        return area
+
     def _build_side_panel(self) -> QWidget:
         tabs = QTabWidget()
-        tabs.addTab(self._build_rw_panel(),       "Read / Write")
-        tabs.addTab(self._build_command_panel(),  "Motor Command")
-        tabs.addTab(self._build_motorcfg_panel(), "Motor Config")
-        tabs.addTab(self._build_setup_panel(),    "CMC Setup")
-        tabs.addTab(self._build_map_panel(),      "Telemetry / Graphing")
+        # Each panel is wrapped in a scroll area so the whole window stays freely resizable
+        # (the dense forms no longer pin a large minimum size). Motor Config already scrolls
+        # its config list internally, so it isn't double-wrapped.
+        tabs.addTab(self._scroll(self._build_rw_panel()),      "Read / Write")
+        tabs.addTab(self._scroll(self._build_command_panel()), "Motor Command")
+        tabs.addTab(self._build_motorcfg_panel(),              "Motor Config")
+        tabs.addTab(self._scroll(self._build_setup_panel()),   "CMC Setup")
+        tabs.addTab(self._scroll(self._build_map_panel()),     "Telemetry / Graphing")
         return tabs
 
     # === Motor Command tab ===================================================
@@ -409,30 +484,41 @@ class MainWindow(QMainWindow):
         self.cmd_joy_lbl.setStyleSheet("font-family: monospace;")
         jrow.addWidget(self.cmd_joy_lbl, 0)
         vl.addRow("Joystick (0x3026 raw):", jrow)
-        # Velocity-demand acceleration ramp (ADR-042) -- smooths the joystick. Motor OD 0x2300:6/7.
+        # Velocity-demand acceleration ramp (ADR-042) -- smooths the joystick. Motor OD 0x2300:6/7/8.
         jkrow = QHBoxLayout()
         self.cmd_accel_up = QLineEdit()
         self.cmd_accel_up.setPlaceholderText("up rad/s²")
-        self.cmd_accel_up.setMaximumWidth(96)
-        self.cmd_accel_up.setToolTip("Acceleration ramp while speeding up [rad/s²]. 0 = off. (0x2300:6)")
+        self.cmd_accel_up.setMaximumWidth(86)
+        self.cmd_accel_up.setToolTip("Max acceleration while speeding up [rad/s²]. 0 = off. (0x2300:6)")
         self.cmd_accel_up.returnPressed.connect(self._cmd_apply_accel)
         jkrow.addWidget(self.cmd_accel_up)
         self.cmd_accel_dn = QLineEdit()
         self.cmd_accel_dn.setPlaceholderText("down rad/s²")
-        self.cmd_accel_dn.setMaximumWidth(96)
-        self.cmd_accel_dn.setToolTip("Acceleration ramp while slowing down [rad/s²]. 0 = off. (0x2300:7)")
+        self.cmd_accel_dn.setMaximumWidth(86)
+        self.cmd_accel_dn.setToolTip("Max acceleration while slowing down [rad/s²]. 0 = off. (0x2300:7)")
         self.cmd_accel_dn.returnPressed.connect(self._cmd_apply_accel)
         jkrow.addWidget(self.cmd_accel_dn)
+        self.cmd_accel_jerk = QLineEdit()
+        self.cmd_accel_jerk.setPlaceholderText("jerk rad/s³")
+        self.cmd_accel_jerk.setMaximumWidth(86)
+        self.cmd_accel_jerk.setToolTip("How fast the acceleration eases UP to the cap [rad/s³]. "
+                                       "It falls freely on the way down. 0 = step (no soft rise). (0x2300:8)")
+        self.cmd_accel_jerk.returnPressed.connect(self._cmd_apply_accel)
+        jkrow.addWidget(self.cmd_accel_jerk)
         b_jk = QPushButton("Apply")
         b_jk.clicked.connect(self._cmd_apply_accel)
         jkrow.addWidget(b_jk)
+        b_jk_rd = QPushButton("Read")
+        b_jk_rd.setToolTip("Read the current accel-ramp values (0x2300:6/7/8) from the motor into the fields.")
+        b_jk_rd.clicked.connect(self._cmd_read_accel)
+        jkrow.addWidget(b_jk_rd)
         self.cmd_accel_bypass = QCheckBox("Bypass")
-        self.cmd_accel_bypass.setToolTip("Bypass the ramp (writes 0/0 -> raw joystick) to A/B the smoothing. "
-                                         "Uncheck to re-apply the fields.")
+        self.cmd_accel_bypass.setToolTip("Bypass the ramp (writes 0/0 to the caps -> raw joystick) to A/B the "
+                                         "smoothing. Uncheck to re-apply the fields.")
         self.cmd_accel_bypass.toggled.connect(self._cmd_accel_bypass_toggled)
         jkrow.addWidget(self.cmd_accel_bypass)
         jkrow.addStretch(1)
-        vl.addRow("Accel ramp up / down:", jkrow)
+        vl.addRow("Accel ramp up / dn / jerk:", jkrow)
 
         # 25 ms = 40 Hz, matching real-panel MOVEMENT cadence. Started on
         # first connect; runs continuously while connected (sends 0 when
@@ -528,6 +614,40 @@ class MainWindow(QMainWindow):
         hint.setWordWrap(True)
         tgl.addWidget(hint)
 
+        # --- Frequency sweep (resonance / FRF identification; drives 0x2920, ADR-047) ---
+        self.cmd_sweepg = sweepg = QGroupBox("Frequency sweep  (resonance ID — current injection)")
+        sgl = QVBoxLayout(sweepg)
+        def _swf(text, w=56):
+            e = QLineEdit(text); e.setMaximumWidth(w); return e
+        sr1 = QHBoxLayout()
+        sr1.addWidget(QLabel("Start:"));   self.cmd_sw_start = _swf("5");   sr1.addWidget(self.cmd_sw_start); sr1.addWidget(QLabel("Hz"))
+        sr1.addWidget(QLabel("  End:"));   self.cmd_sw_end   = _swf("200"); sr1.addWidget(self.cmd_sw_end);   sr1.addWidget(QLabel("Hz"))
+        sr1.addWidget(QLabel("  Step:"));  self.cmd_sw_step  = _swf("5");   sr1.addWidget(self.cmd_sw_step);  sr1.addWidget(QLabel("Hz"))
+        sr1.addWidget(QLabel("  Dwell:")); self.cmd_sw_dwell = _swf("0.5"); sr1.addWidget(self.cmd_sw_dwell); sr1.addWidget(QLabel("s"))
+        sr1.addStretch(1)
+        sgl.addLayout(sr1)
+        sr2 = QHBoxLayout()
+        sr2.addWidget(QLabel("Bias:")); self.cmd_sw_bias = _swf("0"); sr2.addWidget(self.cmd_sw_bias); sr2.addWidget(QLabel("A"))
+        sr2.addWidget(QLabel("  AC amplitude:")); self.cmd_sw_amp = _swf("0.2"); sr2.addWidget(self.cmd_sw_amp); sr2.addWidget(QLabel("A"))
+        b_sw = QPushButton("Start sweep")
+        b_sw.setToolTip("Inject bias + amplitude·sin(2πf t), stepping start→end (generated in the 20 kHz "
+                        "fast loop). Be enabled in torque/current mode first.")
+        b_sw.clicked.connect(self._cmd_sweep_start); sr2.addWidget(b_sw)
+        b_sws = QPushButton("Stop"); b_sws.clicked.connect(self._cmd_sweep_stop); sr2.addWidget(b_sws)
+        self.cmd_sw_bode = QCheckBox("Plot Bode at end")
+        self.cmd_sw_bode.setToolTip("On finish, pop a frequency-vs-velocity-amplitude plot. Needs "
+                                    "tlm_vel_actual_rad_s streaming (telemetry graph, cyclic rate ≥ 1 kHz).")
+        sr2.addWidget(self.cmd_sw_bode)
+        self.cmd_sweep_active = QLabel("idle")
+        self.cmd_sweep_active.setStyleSheet("font-family: monospace; color: #444;")
+        sr2.addWidget(self.cmd_sweep_active); sr2.addStretch(1)
+        sgl.addLayout(sr2)
+        swhint = QLabel("Enable in <b>torque/current</b> mode, then Start. Graph "
+                        "<code>freq_sweep_current_hz</code> (0x2920:8) vs <code>tlm_vel_actual_rad_s</code> "
+                        "(0x2310:2) — resonances show as response peaks. Auto-stops at the end frequency.")
+        swhint.setStyleSheet("color: #666; font-size: 10px;"); swhint.setWordWrap(True)
+        sgl.addWidget(swhint)
+
         # --- Position ---
         self.cmd_posg = posg = QGroupBox("Position profile  (Profile Position)")
         pl = QHBoxLayout(posg)
@@ -576,8 +696,31 @@ class MainWindow(QMainWindow):
         fl.addRow("Velocity (0x606C):", self.cmd_fb_vel)
         fl.addRow("Torque (0x6077):", self.cmd_fb_torque)
         fl.addRow("Target reached:", self.cmd_fb_reached)
+        # Soft position limits (ADR-040/043): capture the live position (above) as lo/hi. Motor OD 0x2600:6/7.
+        self._cmd_last_pos_rad = None
+        self.cmd_lim_lo = QLineEdit()
+        self.cmd_lim_lo.setMaximumWidth(80)
+        self.cmd_lim_lo.setPlaceholderText("lo rad")
+        self.cmd_lim_lo.setToolTip("Soft min position [home-relative rad] (0x2600:6). lo >= hi = limits off.")
+        self.cmd_lim_hi = QLineEdit()
+        self.cmd_lim_hi.setMaximumWidth(80)
+        self.cmd_lim_hi.setPlaceholderText("hi rad")
+        self.cmd_lim_hi.setToolTip("Soft max position [home-relative rad] (0x2600:7). lo >= hi = limits off.")
+        b_lim_apply = QPushButton("Apply")
+        b_lim_apply.clicked.connect(self._cmd_apply_limits)
+        b_lim_lo = QPushButton("Lo←pos")
+        b_lim_lo.setToolTip("Capture the current position (0x6064) as the LOW soft limit.")
+        b_lim_lo.clicked.connect(lambda: self._cmd_capture_limit(6))
+        b_lim_hi = QPushButton("Hi←pos")
+        b_lim_hi.setToolTip("Capture the current position (0x6064) as the HIGH soft limit.")
+        b_lim_hi.clicked.connect(lambda: self._cmd_capture_limit(7))
+        limrow = QHBoxLayout()
+        for wdg in (self.cmd_lim_lo, self.cmd_lim_hi, b_lim_apply, b_lim_lo, b_lim_hi):
+            limrow.addWidget(wdg)
+        limrow.addStretch(1)
+        fl.addRow("Soft limits (0x2600:6/7):", limrow)
         # Entry-point groups in display order: position, velocity, current, tuning, feedback.
-        for g in (self.cmd_posg, self.cmd_velg, self.cmd_curg, self.cmd_tuneg, self.cmd_fbg):
+        for g in (self.cmd_posg, self.cmd_velg, self.cmd_curg, self.cmd_tuneg, self.cmd_sweepg, self.cmd_fbg):
             outer.addWidget(g)
         self._cmd_update_entry_enables()
 
@@ -639,12 +782,23 @@ class MainWindow(QMainWindow):
             self._cmd_apply_accel()
 
     def _cmd_apply_accel(self) -> None:
-        """Write the velocity-demand acceleration ramp limits (0x2300:6/7, ADR-042)."""
-        for edit, key, name in ((self.cmd_accel_up, (0x2300, 6), "vel_accel_up"),
-                                (self.cmd_accel_dn, (0x2300, 7), "vel_accel_dn")):
+        """Write the velocity-demand acceleration ramp params (0x2300:6/7/8, ADR-042)."""
+        for edit, key, name in ((self.cmd_accel_up,   (0x2300, 6), "vel_accel_up"),
+                                (self.cmd_accel_dn,   (0x2300, 7), "vel_accel_dn"),
+                                (self.cmd_accel_jerk, (0x2300, 8), "vel_accel_jerk")):
             t = edit.text().strip()
             if t:
                 self._cmd_write(key, t, name)
+
+    def _cmd_read_accel(self) -> None:
+        """Read the accel-ramp params (0x2300:6/7/8) back into the fields (routed via _cmd_on_state_read)."""
+        if not self.client.connected:
+            QMessageBox.warning(self, "Not connected", "Connect to the CMC first.")
+            return
+        for key in _CMD_READOUT_KEYS:
+            entry = self.od.by_key.get(key)
+            if entry is not None and entry.readable:
+                self.client.read_async(entry)
 
     def _cmd_apply_velocity(self) -> None:
         text = self.cmd_vel_edit.text().strip()
@@ -690,6 +844,10 @@ class MainWindow(QMainWindow):
         drown everything else)."""
         if not self.client.connected:
             return
+        # Only stream the joystick setpoint while the GUI is in joystick mode — otherwise the 40 Hz
+        # 0x3026 writes (and the CMC's auto-switch into JOYSTICK) would fire in every mode.
+        if int(self.cmd_mode_combo.currentData()) != MC_AXIS_MODE_JOYSTICK:
+            return
         raw = self._cmd_joy_map_raw(self.cmd_joy_slider.value())
         if raw is None:
             return
@@ -710,13 +868,35 @@ class MainWindow(QMainWindow):
         self._cmd_write((0x3025, 0), tm, "target_time")
         self._cmd_write((0x3013, 0), 1, "start_move")
 
+    def _cmd_apply_limits(self) -> None:
+        """Write the soft position limits (0x2600:6/7, home-relative rad; lo >= hi = off)."""
+        for edit, key, name in ((self.cmd_lim_lo, (0x2600, 6), "pos_limit_lo_rad"),
+                                (self.cmd_lim_hi, (0x2600, 7), "pos_limit_hi_rad")):
+            t = edit.text().strip()
+            if t:
+                self._cmd_write(key, t, name)
+
+    def _cmd_capture_limit(self, sub: int) -> None:
+        """Capture the live position (0x6064) as a soft limit (sub 6 = lo, 7 = hi)."""
+        pos = getattr(self, "_cmd_last_pos_rad", None)
+        if pos is None:
+            self._log("Soft limit: position not read yet — can't capture.", "WARN")
+            return
+        edit = self.cmd_lim_lo if sub == 6 else self.cmd_lim_hi
+        name = "pos_limit_lo_rad" if sub == 6 else "pos_limit_hi_rad"
+        edit.setText(f"{pos:.5g}")
+        self._cmd_write((0x2600, sub), pos, name)
+
     def _cmd_poll_state(self) -> None:
         if not self.client.connected:
             return
-        for key in _CMD_STATE_KEYS:
-            entry = self.od.by_key.get(key)
-            if entry and entry.readable:
-                self.client.read_async(entry)
+        # One read per cycle (round-robin), not a 5-read burst: each read is a CMC->motor SPI round-trip
+        # and the CMC's OD request queue is small, so a burst overflows it -> INTERNAL detail=0x01 (queue
+        # full). Each state key refreshes ~1x/s; the fast live values arrive via the telemetry stream.
+        self._cmd_rr = (getattr(self, "_cmd_rr", -1) + 1) % len(_CMD_STATE_KEYS)
+        entry = self.od.by_key.get(_CMD_STATE_KEYS[self._cmd_rr])
+        if entry is not None and entry.readable:
+            self.client.read_async(entry)
 
     @staticmethod
     def _cmd_sw_decode(sw: int) -> str:
@@ -739,6 +919,12 @@ class MainWindow(QMainWindow):
         key = res["entry"].key
         if key == (0x3000, 0):
             self.cmd_state_lbl.setText(_AXIS_STATE_NAMES.get(int(res["raw"]), str(res["raw"])))
+        elif key == (0x2300, 6):
+            self.cmd_accel_up.setText(f"{res['si']:.6g}")
+        elif key == (0x2300, 7):
+            self.cmd_accel_dn.setText(f"{res['si']:.6g}")
+        elif key == (0x2300, 8):
+            self.cmd_accel_jerk.setText(f"{res['si']:.6g}")
         elif key == (0x3001, 0):
             self.cmd_mode_actual_lbl.setText(dict(_AXIS_MODES).get(int(res["raw"]), str(res["raw"])))
         elif key == (0x6041, 0):
@@ -746,6 +932,7 @@ class MainWindow(QMainWindow):
             self.cmd_sw_lbl.setText(self._cmd_sw_decode(sw))
             self.cmd_fb_reached.setText("yes" if (sw & 0x0400) else "no")
         elif key == (0x6064, 0):
+            self._cmd_last_pos_rad = res['si']
             self.cmd_fb_pos.setText(f"{res['si']:.5g} rad")
         elif key == (0x606C, 0):
             self.cmd_fb_vel.setText(f"{res['si']:.5g} rad/s")
@@ -753,6 +940,15 @@ class MainWindow(QMainWindow):
             self.cmd_fb_torque.setText(f"{res['si']:.5g} A")
         elif key == (0x2910, 7):   # test_active (tuning generator running)
             self.cmd_tune_active.setText("RUNNING" if int(res["raw"]) else "idle")
+        elif key == (0x2920, 8):   # freq sweep current frequency (ADR-047)
+            self._sweep_cur_hz = float(res["si"])
+        elif key == (0x2920, 9):   # freq sweep active
+            hz = getattr(self, "_sweep_cur_hz", 0.0)
+            act = int(res["raw"])
+            self.cmd_sweep_active.setText(f"RUNNING @ {hz:.0f} Hz" if act else "idle")
+            if getattr(self, "_bode_capturing", False) and not act:   # sweep just finished -> plot
+                self._bode_capturing = False
+                self._bode_finish()
         elif key == (0x2410, 6):   # measured armature current -> Motor Config readout
             self.mcfg_cur_lbl.setText(f"{res['si']:.3f} A")
         elif key == (0x2400, 6):   # derived brushed kp (RO) -> Motor Config readout
@@ -883,21 +1079,44 @@ class MainWindow(QMainWindow):
     # — until then writes are RAM-only and lost on reboot (the warning at the
     # top of the tab spells that out).
     def _build_setup_panel(self) -> QWidget:
-        # Hardcoded list of which OD entries belong here. Grouped by purpose,
-        # in the order they should appear. Keys are (index, sub).
+        # Every operator-settable + persisted setup entry the CMC exposes. Groups
+        # are display order. Most are CMC-owned (0x3xxx), but the "Joystick feel"
+        # ramps live on the motor side at 0x2300:6/7/8 — they're operator-facing
+        # joystick params, so they conceptually belong with the rest of the
+        # joystick setup. The Save button triggers BOTH CMC-side persist AND a
+        # motor-flash save (disable + 0x2800:1 = MC_IF_SAVE_MAGIC + re-enable),
+        # so both kinds of param survive a reboot from a single click.
+        #
+        # Network settings (IP, panel IPs, ports, cmc_device_no) deliberately
+        # NOT here — they live in a separate persist blob configured via the
+        # CMC's own web UI. A mis-set IP via PC tool would lock you out of the
+        # PC tool itself; the web UI is the canonical place for network changes.
         groups = [
-            ("Joystick calibration", [
+            ("Joystick calibration (CMC-owned)", [
                 (0x3022, 0),   # axis_joystick_max_velocity (rad/s)
                 (0x3027, 0),   # axis_joystick_raw_center
                 (0x3028, 0),   # axis_joystick_raw_full_pos
                 (0x3029, 0),   # axis_joystick_raw_full_neg
                 (0x302A, 0),   # axis_joystick_raw_deadband
             ]),
-            ("Motion limits", [
+            ("Joystick feel — velocity ramps (motor-owned)", [
+                # Motor's velocity-demand slew envelope (CHANGELOG [4.5.0]).
+                # accel_up rad/s^2 while speeding up, accel_dn while slowing,
+                # accel_jerk rad/s^3 eases the start (0 = step to cap).
+                (0x2300, 6),   # vel_accel_up
+                (0x2300, 7),   # vel_accel_dn
+                (0x2300, 8),   # vel_accel_jerk
+            ]),
+            ("Motion limits (CMC-owned, also mirrored to motor 0x2600:4-7)", [
                 (0x3030, 0),   # axis_velocity_limit (rad/s)
                 (0x3031, 0),   # axis_position_limit_lo (rad)
                 (0x3032, 0),   # axis_position_limit_hi (rad)
                 (0x3033, 0),   # axis_accel_limit (rad/s^2)
+            ]),
+            ("Torque mode (UP/DOWN button jog)", [
+                # axis_button_current — magnitude (A) the on-board UP/DOWN
+                # buttons inject while op_mode = TORQUE. UP = +I, DOWN = -I.
+                (0x302C, 0),
             ]),
         ]
 
@@ -906,9 +1125,10 @@ class MainWindow(QMainWindow):
 
         warn = QLabel(
             "<b>Persistence:</b> edits land in CMC RAM immediately on <b>Apply</b>. "
-            "Click <b>Save to flash</b> to commit the current values to the CMC's internal "
-            "flash — they'll survive a reboot. Saved state is restored automatically at the "
-            "next CMC boot."
+            "Click <b>Save to flash</b> to commit them. Save now writes BOTH the CMC's "
+            "internal flash (joystick cal, motion limits, LED) AND triggers a motor-side "
+            "flash save (joystick-feel ramps, motion-envelope limits, load factor). "
+            "The motor briefly disables for ~500 ms during its flash write."
         )
         warn.setWordWrap(True)
         warn.setStyleSheet("color: #115522; padding: 6px; background: #f0f9f0; border: 1px solid #c0e0c0;")
@@ -951,14 +1171,27 @@ class MainWindow(QMainWindow):
         # config (joystick cal + motion limits) via app/persist + bsp/flash.
         b_save = QPushButton("Save to flash")
         b_save.setToolTip(
-            "Commit the values above to the CMC's internal flash. They will\n"
-            "survive a CMC reboot. Writes OD 0x3050 = 0x7376 (MC_IF_SAVE_MAGIC).\n"
-            "Blocks the CMC for ~30 ms (one flash page erase)."
+            "Commits CMC settings to CMC flash AND triggers a motor-side flash save:\n"
+            "  - CMC: joystick cal, motion limits, LED colour (~30 ms erase blocks the CMC)\n"
+            "  - Motor: joystick-feel ramps, motion envelope, load factor, brushed gains\n"
+            "    (motor briefly disables for ~500 ms so its flash write can run)\n"
+            "Writes OD 0x3050 = 0x7376 (MC_IF_SAVE_MAGIC) — same trigger the web UI uses."
         )
         b_save.clicked.connect(self._setup_save_to_flash)
         btns.addWidget(b_save)
         btns.addStretch(1)
         outer.addLayout(btns)
+
+        # Footer note: where to set what isn't on this page.
+        footer = QLabel(
+            "<i>Network settings (IP, panel IPs + ports, CMC device number) live in a "
+            "separate persist blob and are configured via the CMC's own web UI at "
+            "<b>http://&lt;cmc_ip&gt;/</b> — kept off this page because a mis-set IP via "
+            "PC tool would lock you out of the PC tool itself.</i>"
+        )
+        footer.setWordWrap(True)
+        footer.setStyleSheet("color: #555; padding: 8px; font-size: 11px;")
+        outer.addWidget(footer)
 
         outer.addStretch(1)
         return w
@@ -1089,6 +1322,224 @@ class MainWindow(QMainWindow):
         self._log("SETUP SAVE -> CMC flash (writing OD 0x3050 = SAVE_MAGIC)", "TX")
         self.client.write_async(save_entry, self._SAVE_MAGIC)
 
+    def _cmd_sweep_start(self) -> None:
+        """Write the sweep params (0x2920:1-6) and start it with a clean enable 0->1 edge."""
+        if not self.client.connected:
+            QMessageBox.warning(self, "Not connected", "Connect to the CMC first."); return
+        try:
+            vals = {1: float(self.cmd_sw_start.text()), 2: float(self.cmd_sw_end.text()),
+                    3: float(self.cmd_sw_step.text()),  4: float(self.cmd_sw_dwell.text()),
+                    5: float(self.cmd_sw_bias.text()),  6: float(self.cmd_sw_amp.text())}
+        except ValueError:
+            QMessageBox.warning(self, "Bad value", "Sweep fields must be numbers."); return
+        names = {1: "freq_sweep_start_hz", 2: "freq_sweep_end_hz", 3: "freq_sweep_step_hz",
+                 4: "freq_sweep_dwell_s", 5: "freq_sweep_bias_a", 6: "freq_sweep_amplitude_a"}
+        for sub, v in vals.items():
+            self._cmd_write((0x2920, sub), v, names[sub])
+        self._cmd_write((0x2920, 7), 0, "freq_sweep_enable")   # ensure a clean rising edge
+        self._cmd_write((0x2920, 7), 1, "freq_sweep_enable")   # run
+        self._log(f"freq sweep {vals[1]:.0f}->{vals[2]:.0f} Hz step {vals[3]:.0f}, dwell {vals[4]:.2f}s, "
+                  f"{vals[6]:.2f} A AC + {vals[5]:.2f} A bias", "INFO")
+        self._bode_capturing = bool(self.cmd_sw_bode.isChecked())
+        if self._bode_capturing:     # remember t0 + schedule so we can bin the streamed velocity per freq
+            self._bode = {"start": vals[1], "end": vals[2], "step": vals[3], "dwell": vals[4],
+                          "t0": self.buffer.latest_t}
+
+    def _cmd_sweep_stop(self) -> None:
+        """Stop the sweep (freq_sweep_enable = 0)."""
+        if self.client.connected:
+            self._cmd_write((0x2920, 7), 0, "freq_sweep_enable")
+
+    @staticmethod
+    def _bode_amplitudes(buffer, name, start, end, step, dwell, t0, settle_frac=0.4):
+        """Per-frequency response from the streamed buffer: over the steady-state part of each dwell,
+        detrend (remove DC + any bias-driven ramp), take RMS·√2, then scale by f to normalise out the
+        rigid-body 1/ω velocity rolloff (v = τ/(Jω)) so resonances stand out. Returns (freqs[], amps[])."""
+        import numpy as np
+        freqs = np.arange(start, end + step / 2.0, step)
+        out_f, out_a = [], []
+        for i, f in enumerate(freqs):
+            w = buffer.window(name, t0 + i * dwell + settle_frac * dwell, t0 + (i + 1) * dwell)
+            if w is None or len(w[0]) < 4:
+                continue
+            tt, vv = w
+            resid = vv - np.polyval(np.polyfit(tt, vv, 1), tt)        # detrend DC + bias ramp
+            amp = float(resid.std() * (2.0 ** 0.5)) * float(f)        # × f removes the rigid-body 1/ω
+            out_f.append(float(f)); out_a.append(amp)
+        return out_f, out_a
+
+    def _bode_finish(self) -> None:
+        """Sweep finished with capture armed -> compute the response curve + pop the plot."""
+        b = getattr(self, "_bode", None)
+        if not b:
+            return
+        if self.buffer.get("tlm_vel_actual_rad_s") is None:
+            QMessageBox.warning(self, "No velocity data", "Bode needs tlm_vel_actual_rad_s streaming — add "
+                                "it to the telemetry graph (cyclic rate ≥ 1 kHz) and re-run the sweep.")
+            return
+        f, a = self._bode_amplitudes(self.buffer, "tlm_vel_actual_rad_s",
+                                     b["start"], b["end"], b["step"], b["dwell"], b["t0"])
+        if not f:
+            QMessageBox.warning(self, "No data", "No velocity samples landed in the sweep windows "
+                                "(cyclic rate high enough, velocity streaming?).")
+            return
+        self._show_bode(f, a)
+
+    def _show_bode(self, freqs, amps) -> None:
+        """Pop a non-modal frequency-vs-amplitude window (resonances show as peaks)."""
+        from PySide6.QtWidgets import QDialog, QCheckBox
+        import pyqtgraph as pg
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Resonance sweep — velocity amplitude vs frequency")
+        dlg.resize(680, 460)
+        lay = QVBoxLayout(dlg)
+        ctl = QHBoxLayout()
+        cb_logf = QCheckBox("Log frequency"); cb_logf.setChecked(True)
+        cb_loga = QCheckBox("Log amplitude")
+        ctl.addWidget(cb_logf); ctl.addWidget(cb_loga); ctl.addStretch(1)
+        lay.addLayout(ctl)
+        pw = pg.PlotWidget(background="w")
+        pw.setLabel("bottom", "Frequency", units="Hz")
+        pw.setLabel("left", "Velocity amplitude × f  (1/ω-normalised)")
+        pw.showGrid(x=True, y=True, alpha=0.3)
+        pw.plot(freqs, amps, pen=pg.mkPen("#1f77b4", width=2),
+                symbol="o", symbolSize=5, symbolBrush="#1f77b4")
+
+        # Two draggable frequency cursors with a live readout (track the log/linear toggle).
+        import numpy as np
+        fa = np.asarray(freqs, dtype=float); aa = np.asarray(amps, dtype=float)
+        f_lo, f_hi = float(fa.min()), float(fa.max())
+        m1 = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen("#d62728", width=1), label="M1")
+        m2 = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen("#2ca02c", width=1), label="M2")
+        marker_f = {m1: f_lo + (f_hi - f_lo) / 3.0, m2: f_lo + 2.0 * (f_hi - f_lo) / 3.0}
+        readout = QLabel(""); readout.setStyleSheet("font-family: monospace;")
+        def _to_f(v):    return (10.0 ** v if cb_logf.isChecked() else v)            # view coord -> Hz
+        def _to_view(f): return (np.log10(f) if (cb_logf.isChecked() and f > 0.0) else f)
+        def _readout():
+            parts = []
+            for m, tag in ((m1, "M1"), (m2, "M2")):
+                f = min(f_hi, max(f_lo, _to_f(m.value())))
+                parts.append(f"{tag}: {f:7.2f} Hz  A={float(np.interp(f, fa, aa)):.4g}")
+            readout.setText("     ".join(parts)
+                            + f"      Δf = {abs(_to_f(m1.value()) - _to_f(m2.value())):.2f} Hz")
+        def _on_move(line):
+            marker_f[line] = _to_f(line.value()); _readout()
+        for m in (m1, m2):
+            m.sigPositionChanged.connect(_on_move)
+            pw.addItem(m)
+
+        def _apply_log():
+            pw.setLogMode(cb_logf.isChecked(), cb_loga.isChecked())
+            for m in (m1, m2):
+                m.setValue(_to_view(marker_f[m]))      # keep each cursor at its frequency across the toggle
+            _readout()
+        cb_logf.toggled.connect(_apply_log)
+        cb_loga.toggled.connect(_apply_log)
+        _apply_log()   # default: log frequency on; also positions the cursors + readout
+        lay.addWidget(pw)
+        lay.addWidget(readout)
+        dlg.setModal(False)
+        dlg.show()
+        self._bode_dlg = dlg   # keep a reference so it isn't garbage-collected
+
+    def _mcfg_set_dac_source(self) -> None:
+        """Apply the debug DAC source selection (0x2900:5) live when connected."""
+        if self.client.connected:
+            self._cmd_write((0x2900, 5), int(self.mcfg_dac_source.currentData()), "dac_source")
+
+    def _dq_run(self) -> None:
+        """Fire the open-loop d-axis voltage pulse (0x2900:6/7/9 + arm :8) for plant ID."""
+        if not self.client.connected:
+            QMessageBox.warning(self, "Not connected", "Connect to the CMC first.")
+            return
+        if QMessageBox.question(
+                self, "Fire d-axis pulse",
+                "This applies an open-loop voltage and energizes the motor, bypassing the CMC.\n\n"
+                "Ensure the axis is mechanically clear and the CMC axis_manager is OFF. Continue?"
+            ) != QMessageBox.StandardButton.Yes:
+            return
+        idx = self.mcfg_dac_source.findData(4)          # ia = id at angle 0 -> show it on PA4
+        if idx >= 0:
+            self.mcfg_dac_source.setCurrentIndex(idx)   # fires _mcfg_set_dac_source -> writes 0x2900:5
+        self._cmd_write((0x2900, 6), float(self.dq_volts.value()), "dq_test_voltage_v")
+        self._cmd_write((0x2900, 7), float(self.dq_angle.value()), "dq_test_angle_rad")
+        self._cmd_write((0x2900, 9), int(self.dq_dwell.value()),   "dq_test_dwell_ms")
+        self._cmd_write((0x2900, 8), 1, "dq_test_enable")          # arm last -> pulse fires
+        self._log(f"d-axis pulse: {self.dq_volts.value():.2f} V @ {self.dq_angle.value():.3f} rad "
+                  f"for {int(self.dq_dwell.value())} ms — scope PA4 (ia)", "INFO")
+
+    def _dq_stop(self) -> None:
+        """Abort the d-axis pulse early (0x2900:8 = 0)."""
+        if self.client.connected:
+            self._cmd_write((0x2900, 8), 0, "dq_test_enable")
+
+    def _obs_apply_damping(self) -> None:
+        """Compute obs_kv = 2·ζ·√(obs_kp) from the entered damping + the last-read obs_kp, write 0x2500:5."""
+        kp = self._mcfg_vals.get((0x2500, 3))
+        if not kp or kp <= 0.0:
+            QMessageBox.warning(self, "obs_kp unknown",
+                                "Read the estimator gains first (Read all) so obs_kp is known, then set ζ.")
+            return
+        zeta = float(self.obs_zeta.value())
+        kv = 2.0 * zeta * math.sqrt(kp)
+        self._cmd_write((0x2500, 5), kv, "obs_kv")
+        self._mcfg_vals[(0x2500, 5)] = kv
+        self._mcfg_update_bw()
+        self._log(f"observer ζ={zeta:.2f} → obs_kv = 2·{zeta:.2f}·√(obs_kp={kp:.1f}) = {kv:.3f}", "INFO")
+
+    def _mcfg_update_bw(self) -> None:
+        """Recompute the per-loop bandwidth estimates from the latest read-back gains + plant params.
+        First-order approximations (each assumes its inner loop/observer is much faster). See ADR-003."""
+        v = self._mcfg_vals
+        def hz(w):
+            return w / (2.0 * math.pi)
+
+        lbl = self._bw_labels.get("State estimator (0x2500)")
+        if lbl is not None:
+            kp, kv = v.get((0x2500, 3)), v.get((0x2500, 5))
+            alpha, flt = v.get((0x2500, 7)), v.get((0x2500, 2))
+            if kp and kp > 0.0:                         # observer: omega_n = sqrt(obs_kp)
+                wn = math.sqrt(kp)
+                txt = f"observer ≈ {hz(wn):.1f} Hz"
+                if kv is not None:
+                    txt += f", ζ={kv / (2.0 * wn):.2f}"
+                if alpha and 0.0 < alpha < 1.0:         # observer OUTPUT LPF = obs_filter_alpha @ 1 kHz
+                    fc = -math.log(1.0 - alpha) * 1000.0 / (2.0 * math.pi)
+                    txt += f"; output LPF ≈ {fc:.0f} Hz"
+                if flt:                                 # velocity_filter_hz shapes ONLY the finite-diff fallback
+                    txt += f" (finite-diff fallback {flt:.0f} Hz)"
+                lbl.setText(txt)
+
+        lbl = self._bw_labels.get("Velocity loop gains (0x2300)")
+        if lbl is not None:
+            kp, ki, J = v.get((0x2300, 1)), v.get((0x2300, 2)), v.get((0x2000, 2))
+            if kp and J and J > 0.0:                    # vel_kp is torque-form; kp/J = small-signal crossover
+                xo = hz(kp / J)
+                xo_s = f"{xo / 1000.0:.1f} kHz" if xo >= 1000.0 else f"{xo:.0f} Hz"
+                txt = (f"PI corner ≈ {hz(ki / kp):.1f} Hz · " if (ki and kp) else "")
+                txt += (f"small-signal crossover ≈ {xo_s} (gain ≫ inner loops → current-limited; "
+                        "real BW set by the current loop + velocity feedback)")
+                lbl.setText(txt)
+            elif kp and not J:
+                lbl.setText("read inertia (0x2000:2) for an estimate")
+
+        lbl = self._bw_labels.get("Current loop gains (0x2400)")
+        if lbl is not None:
+            kp, L, wc_b = v.get((0x2400, 3)), v.get((0x2000, 4)), v.get((0x2400, 8))
+            parts = []
+            if kp and L and L > 0.0:                    # FOC iq crossover ~ iq_kp/L
+                parts.append(f"FOC iq ≈ {hz(kp / L):.0f} Hz")
+            if wc_b and wc_b > 0.0:                     # brushed: hb_cur_bandwidth is the design wc
+                parts.append(f"brushed wc {hz(wc_b):.0f} Hz")
+            if parts:
+                lbl.setText(", ".join(parts))
+
+        lbl = self._bw_labels.get("Position loop gains (0x2200)")
+        if lbl is not None:
+            kp = v.get((0x2200, 1))
+            if kp is not None and kp > 0.0:             # P-loop crossover ~ pos_kp
+                lbl.setText(f"≈ {hz(kp):.2f} Hz (P loop, assumes a fast velocity loop)")
+
     def _setup_on_read_done(self, entry: OdEntry, ok: bool, text: str, err: str) -> None:
         row = self._cfg_row(entry.key)
         if row is None:
@@ -1141,7 +1592,7 @@ class MainWindow(QMainWindow):
         ("Velocity loop gains (0x2300)", [
             (0x2300, 1), (0x2300, 2), (0x2300, 3), (0x2300, 4),
             (0x2300, 5),  # vel_load_factor (REQ-0014) — operator load multiplier on kp/ki
-            (0x2300, 6), (0x2300, 7),   # velocity-demand jerk limits (ADR-042)
+            (0x2300, 6), (0x2300, 7), (0x2300, 8),   # velocity-demand accel ramp: caps + ramp-up jerk (ADR-042)
         ]),
         ("Current loop gains (0x2400)", [
             (0x2400, 1), (0x2400, 2), (0x2400, 3), (0x2400, 4), (0x2400, 5),
@@ -1150,15 +1601,19 @@ class MainWindow(QMainWindow):
         ("State estimator (0x2500)", [
             # 0x2500:1 est_electrical_offset is a calibration RESULT (set by the align routine), not an
             # editable config -- it would be overwritten if set, so it's not an editable row here.
-            (0x2500, 2), (0x2500, 3), (0x2500, 4), (0x2500, 5), (0x2500, 6),
+            (0x2500, 2), (0x2500, 3), (0x2500, 4), (0x2500, 5), (0x2500, 6), (0x2500, 7),
+        ]),
+        ("Notch filter — current command (0x2930)", [
+            (0x2930, 1), (0x2930, 2), (0x2930, 3),   # enable (1/0) / centre Hz / bandwidth Hz (ADR-048)
         ]),
         ("Faults / limits (0x2600)", [
             (0x2600, 2),
             (0x2600, 4), (0x2600, 5),   # motor safety envelope: vel/accel ceiling (ADR-040; 0 = disabled)
             (0x2600, 6), (0x2600, 7),   # soft position limits, home-rel (ADR-040; lo>=hi = disabled)
         ]),
-        ("Motion profile (CiA-402)", [
-            (0x6081, 0), (0x6083, 0), (0x6084, 0), (0x6085, 0),
+        ("Trajectory profile (S-curve, 0x2600:8/9)", [
+            (0x2600, 8),   # max_jerk_rad_s3 — fixed jerk for the S-curve planner (ADR-045)
+            (0x2600, 9),   # traj_use_scurve — 1 = jerk-limited S-curve, 0 = trapezoidal (default)
         ]),
         ("Electrical-alignment parameters (0x2700)", [
             (0x2700, 3), (0x2700, 4),
@@ -1208,6 +1663,61 @@ class MainWindow(QMainWindow):
         bbl.addStretch(1)
         col.addWidget(bb)
 
+        # Debug DAC output selector (0x2900:5 dac_source) -> PA4 / DAC1_OUT1, scaled by dac_scale (1 V/A).
+        dg = QGroupBox("Debug DAC output (PA4)")
+        dgl = QHBoxLayout(dg)
+        dgl.addWidget(QLabel("Signal:"))
+        self.mcfg_dac_source = QComboBox()
+        for _lbl, _val in (("|iq| (q-axis magnitude)", 0), ("iq (signed)", 1),
+                           ("|id| (d-axis magnitude)", 2), ("id (signed)", 3),
+                           ("ia (phase A = id at angle 0)", 4), ("ib (phase B)", 5),
+                           ("ic (phase C)", 6), ("i_max (max |phase|)", 7), ("i_arm (brushed)", 8)):
+            self.mcfg_dac_source.addItem(_lbl, _val)
+        self.mcfg_dac_source.setToolTip("What PA4 (DAC1_OUT1) outputs, scaled 1 V/A. The DAC is unipolar "
+                                        "(0–3.3 V), so signed signals clip below 0 — use the |.| options "
+                                        "or keep the signal positive (e.g. id during a d-axis voltage step).")
+        self.mcfg_dac_source.currentIndexChanged.connect(self._mcfg_set_dac_source)
+        dgl.addWidget(self.mcfg_dac_source)
+        dgl.addStretch(1)
+        col.addWidget(dg)
+
+        # Plant ID -- open-loop d-axis voltage pulse (ADR-046). Fires Vd for a dwell, then auto-returns to
+        # 0. Energizes the motor open-loop (bypasses the CMC); scope the response on PA4.
+        pg = QGroupBox("Plant ID — d-axis voltage pulse (open-loop)")
+        pgl = QFormLayout(pg)
+        self.dq_volts = QDoubleSpinBox()
+        self.dq_volts.setRange(0.0, 12.0); self.dq_volts.setSingleStep(0.5)
+        self.dq_volts.setDecimals(2); self.dq_volts.setValue(1.5); self.dq_volts.setSuffix(" V")
+        self.dq_volts.setToolTip("Open-loop d-axis voltage (firmware clamps to ±12 V ≈ Vbus/2). id_ss = V/R, "
+                                 "so SET THE OC TRIP (0x2600:2) FIRST — R≈0.84 Ω → 6 V ≈ 7 A.")
+        pgl.addRow("d-axis voltage:", self.dq_volts)
+        self.dq_angle = QDoubleSpinBox()
+        self.dq_angle.setRange(0.0, 6.2832); self.dq_angle.setSingleStep(0.1)
+        self.dq_angle.setDecimals(3); self.dq_angle.setValue(0.0); self.dq_angle.setSuffix(" rad")
+        self.dq_angle.setToolTip("Forced electrical angle. Leave 0 (d-axis = phase A, so id = ia).")
+        pgl.addRow("electrical angle:", self.dq_angle)
+        self.dq_dwell = QDoubleSpinBox()
+        self.dq_dwell.setRange(1.0, 10000.0); self.dq_dwell.setSingleStep(50.0)
+        self.dq_dwell.setDecimals(0); self.dq_dwell.setValue(500.0); self.dq_dwell.setSuffix(" ms")
+        self.dq_dwell.setToolTip("How long Vd is held before it auto-returns to 0. The electrical transient "
+                                 "is ~1.3 ms, so 500 ms easily captures the rise + steady state.")
+        pgl.addRow("dwell:", self.dq_dwell)
+        prow = QHBoxLayout()
+        self.dq_run = QPushButton("Fire pulse")
+        self.dq_run.setToolTip("Point the DAC at ia, apply Vd for the dwell, then return to 0. The motor "
+                               "goes live open-loop and bypasses the CMC — set axis_manager OFF, axis clear.")
+        self.dq_run.clicked.connect(self._dq_run)
+        self.dq_stop = QPushButton("Stop")
+        self.dq_stop.setToolTip("Abort the pulse early (Vd → 0 now).")
+        self.dq_stop.clicked.connect(self._dq_stop)
+        prow.addWidget(self.dq_run); prow.addWidget(self.dq_stop); prow.addStretch(1)
+        pgl.addRow(prow)
+        note = QLabel("Scope PA4 (= id). τ=L/R from the rise gives L. For R, sweep V and fit slope of "
+                      "id_ss vs V — dead time (~0.9 V) biases a single point.")
+        note.setWordWrap(True); note.setStyleSheet("color: #888;")
+        pgl.addRow(note)
+        col.addWidget(pg)
+
         # Live current-loop readouts. Measured current streams via the telemetry map (no polling); the
         # derived gains are read once on connect + ~100 ms after an R/L/bandwidth edit.
         cg = QGroupBox("Live current loop")
@@ -1241,16 +1751,6 @@ class MainWindow(QMainWindow):
         for group_title, keys in self._MOTORCFG_GROUPS:
             box = QGroupBox(group_title)
             grid = QFormLayout(box)
-            if group_title.startswith("Motion profile"):
-                note = QLabel(
-                    "Note: profile velocity / accel / decel (0x6081 / 0x6083 / 0x6084) are "
-                    "<b>mirrored from the CMC</b> (axis_velocity_limit 0x3030, axis_accel_limit "
-                    "0x3033) — set and save them on the <b>CMC Setup</b> tab. Values written here "
-                    "are overwritten by the CMC on its next sync, so a motor-side save of these "
-                    "will not stick. (quick_stop_deceleration 0x6085 is motor-owned and does persist here.)")
-                note.setWordWrap(True)
-                note.setStyleSheet("color:#b06000; padding:2px;")
-                grid.addRow(note)
             for key in keys:
                 entry = self.od.by_key.get(key)
                 if entry is None:
@@ -1260,9 +1760,31 @@ class MainWindow(QMainWindow):
                 grid.addRow(self._setup_row_label(entry), row_widgets["container"])
                 self._mcfg_rows[key] = row_widgets
                 self._mcfg_keys.append(key)
+            if group_title in ("Position loop gains (0x2200)", "Velocity loop gains (0x2300)",
+                               "Current loop gains (0x2400)", "State estimator (0x2500)"):
+                bw = QLabel("read gains to estimate")
+                bw.setStyleSheet("color:#666; font-style:italic;")
+                bw.setWordWrap(True)
+                grid.addRow("Est. bandwidth:", bw)
+                self._bw_labels[group_title] = bw
+            if group_title == "State estimator (0x2500)":
+                zrow = QHBoxLayout()
+                self.obs_zeta = QDoubleSpinBox()
+                self.obs_zeta.setRange(0.1, 5.0); self.obs_zeta.setSingleStep(0.05)
+                self.obs_zeta.setDecimals(2); self.obs_zeta.setValue(1.0)
+                self.obs_zeta.setToolTip("Target observer damping ζ. 'Set kv from ζ' computes "
+                                         "obs_kv = 2·ζ·√(obs_kp) and writes it (0x2500:5). Read the gains first "
+                                         "so obs_kp is known. Exact only while obs_ki = 0.")
+                zrow.addWidget(self.obs_zeta)
+                zbtn = QPushButton("Set kv from ζ")
+                zbtn.clicked.connect(self._obs_apply_damping)
+                zrow.addWidget(zbtn); zrow.addStretch(1)
+                zw = QWidget(); zw.setLayout(zrow)
+                grid.addRow("Damping ζ:", zw)
             col.addWidget(box)
 
         col.addWidget(self._build_motorcfg_actions())
+        col.addWidget(self._build_inertia_estimator())
         col.addStretch(1)
 
         scroll = QScrollArea()
@@ -1398,6 +1920,468 @@ class MainWindow(QMainWindow):
         s.setValue(raw & 0xFF)
         s.blockSignals(False)
         self._led_on_slider_drag(raw & 0xFF)
+
+    # ===== Inertia estimator (PC-tool-side) ===============================
+    # Step-response inertia identification. Applies a known current step in
+    # TORQUE mode, measures the rotor's resulting velocity, computes the
+    # plant gain α/I = ω/(I·T), and from that recommends a PI velocity-loop
+    # kp/ki for the operator's chosen bandwidth. NO firmware change — runs
+    # entirely from this PC tool using existing OD entries.
+    #
+    # State machine (advanced by QTimer.singleShot, all SDOs async via the
+    # existing client.write_async / read_async + od_read_done signal):
+    #
+    #   IDLE → SAVE_MODE → SET_TORQUE → BASELINE_V → APPLY_I → WAIT → MEASURE_V
+    #        → ZERO_I → RESTORE_MODE → COMPUTE → IDLE
+    #
+    # The whole thing aborts to a safe state (current=0, mode restored) on
+    # any error or pre-check failure.
+    _INERTIA_IDLE        = 0
+    _INERTIA_SAVE_MODE   = 1   # read current op_mode for later restore
+    _INERTIA_SET_TORQUE  = 2   # switch to TORQUE
+    _INERTIA_BASELINE_V  = 3   # read velocity_actual baseline
+    _INERTIA_APPLY_I     = 4   # write target_current = I_step
+    _INERTIA_MEASURE_V   = 5   # T_step later, read velocity_actual
+    _INERTIA_ZERO_I      = 6   # write target_current = 0
+    _INERTIA_RESTORE_MODE= 7   # switch op_mode back
+    _INERTIA_COMPUTE     = 8   # crunch numbers + display
+    _INERTIA_DONE        = 9
+
+    def _build_inertia_estimator(self) -> QWidget:
+        box = QGroupBox("Inertia Estimator")
+        col = QVBoxLayout(box)
+
+        intro = QLabel(
+            "Step-response identification of the rotor inertia. With the motor "
+            "<b>enabled and at the mechanical zero position</b> (use Position mode "
+            "to park it first), this applies a known torque-mode current step "
+            "for the configured duration, measures the resulting velocity, and "
+            "recommends a PI velocity-loop kp/ki for the chosen bandwidth.<br>"
+            "<b>Warning:</b> the rotor will spin freely during the test — keep "
+            "anything fragile clear of the rotation path. After the test the "
+            "motor returns to the saved operating mode; if that's Position mode "
+            "the rotor will snap back to its commanded position."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color:#555;padding:4px;")
+        col.addWidget(intro)
+
+        # Live readouts so the operator can confirm pre-conditions.
+        live = QHBoxLayout()
+        live.addWidget(QLabel("Position (0x6064):"))
+        self.inertia_lbl_pos = QLabel("-")
+        self.inertia_lbl_pos.setStyleSheet("font-family:monospace;min-width:90px;")
+        live.addWidget(self.inertia_lbl_pos)
+        live.addSpacing(20)
+        live.addWidget(QLabel("Velocity (0x606C):"))
+        self.inertia_lbl_vel = QLabel("-")
+        self.inertia_lbl_vel.setStyleSheet("font-family:monospace;min-width:90px;")
+        live.addWidget(self.inertia_lbl_vel)
+        live.addStretch(1)
+        col.addLayout(live)
+
+        # Inputs.
+        form = QFormLayout()
+        self.inertia_edit_i = QLineEdit("0.5")
+        self.inertia_edit_i.setMaximumWidth(80)
+        self.inertia_edit_i.setToolTip(
+            "Current step amplitude in amps. Pick something that won't violate "
+            "the motor's max current and that produces a measurable velocity "
+            "within the chosen duration. 0.3–1.0 A is typical for small motors.")
+        form.addRow("Test current (A):", self.inertia_edit_i)
+
+        self.inertia_edit_t = QLineEdit("200")
+        self.inertia_edit_t.setMaximumWidth(80)
+        self.inertia_edit_t.setToolTip(
+            "Step duration in milliseconds. Longer = higher final velocity, "
+            "more measurement accuracy, BUT more rotor travel (no upper cap "
+            "— operator's responsibility to pick a value that won't slam "
+            "the rotor into something). Minimum 10 ms (SDO latency floor). "
+            "100–500 ms typical for a starting estimate.")
+        form.addRow("Test duration (ms):", self.inertia_edit_t)
+
+        # Bandwidth row with live Hz display.
+        bw_row = QHBoxLayout()
+        self.inertia_edit_bw = QLineEdit("50")
+        self.inertia_edit_bw.setMaximumWidth(80)
+        self.inertia_edit_bw.setToolTip(
+            "Desired closed-loop bandwidth of the velocity PI. Higher = stiffer "
+            "response but less margin. 30–100 rad/s is typical for a brushed-DC "
+            "or PMSM camera-axis motor.")
+        # Live updates: refresh both the Hz translation AND (if a test has
+        # already run) the kp/ki recommendation. Lets the operator sweep
+        # bandwidth values without re-running the step test.
+        self.inertia_edit_bw.textChanged.connect(self._inertia_update_bw_hz)
+        self.inertia_edit_bw.textChanged.connect(self._inertia_recompute_recommendations)
+        bw_row.addWidget(self.inertia_edit_bw, 0)
+        bw_row.addWidget(QLabel("rad/s  ≈"), 0)
+        self.inertia_lbl_bw_hz = QLabel("7.96 Hz")
+        self.inertia_lbl_bw_hz.setStyleSheet("color:#555;")
+        bw_row.addWidget(self.inertia_lbl_bw_hz, 0)
+        bw_row.addStretch(1)
+        form.addRow("Desired bandwidth:", bw_row)
+
+        col.addLayout(form)
+
+        # Run + status.
+        run_row = QHBoxLayout()
+        self.inertia_btn_run = QPushButton("Run estimation")
+        self.inertia_btn_run.clicked.connect(self._inertia_run)
+        run_row.addWidget(self.inertia_btn_run, 0)
+        self.inertia_lbl_status = QLabel("Idle.")
+        self.inertia_lbl_status.setStyleSheet("color:#555;font-style:italic;")
+        run_row.addWidget(self.inertia_lbl_status, 1)
+        col.addLayout(run_row)
+
+        # Results display.
+        res = QFormLayout()
+
+        # Raw velocity samples — cross-check against the telemetry graph.
+        # Baseline should be 0 rad/s (rotor at rest); if it isn't, the
+        # operator hasn't actually parked the rotor before pressing Run.
+        self.inertia_lbl_velocities = QLabel("-")
+        self.inertia_lbl_velocities.setStyleSheet("font-family:monospace;")
+        res.addRow("Velocity (start → end):", self.inertia_lbl_velocities)
+
+        self.inertia_lbl_alpha   = QLabel("-")
+        self.inertia_lbl_alpha.setStyleSheet("font-family:monospace;")
+        res.addRow("Measured α/I:", self.inertia_lbl_alpha)
+
+        self.inertia_lbl_jkt     = QLabel("-")
+        self.inertia_lbl_jkt.setStyleSheet("font-family:monospace;")
+        res.addRow("Implied J/K_t:", self.inertia_lbl_jkt)
+
+        # Measured inertia J — needs motor K_t (0x2000:1 motor_kt_nm_per_a),
+        # which we poll alongside the live readouts. If K_t isn't available
+        # yet (motor not replying, OD missing) we show the J/K_t form only.
+        self.inertia_lbl_j       = QLabel("-")
+        self.inertia_lbl_j.setStyleSheet("font-family:monospace;font-weight:bold;")
+        res.addRow("Measured inertia J:", self.inertia_lbl_j)
+
+        self.inertia_lbl_kp      = QLabel("-")
+        self.inertia_lbl_kp.setStyleSheet("font-family:monospace;font-weight:bold;color:#115522;")
+        res.addRow("Recommended vel_kp (0x2300:1):", self.inertia_lbl_kp)
+
+        self.inertia_lbl_ki      = QLabel("-")
+        self.inertia_lbl_ki.setStyleSheet("font-family:monospace;font-weight:bold;color:#115522;")
+        res.addRow("Recommended vel_ki (0x2300:2):", self.inertia_lbl_ki)
+
+        col.addLayout(res)
+
+        # State-machine working memory.
+        self._inertia_state       = self._INERTIA_IDLE
+        self._inertia_saved_mode  = None
+        self._inertia_v_baseline  = 0.0
+        self._inertia_v_peak      = 0.0
+        self._inertia_t_apply_ms  = 0
+        self._inertia_t_measure_ms= 0
+        self._inertia_i_step      = 0.0
+        self._inertia_t_step_ms   = 0
+        self._inertia_bw_rad_s    = 50.0
+        # Cached measurement from the last successful test. Lets the operator
+        # sweep the bandwidth field after the test to see different kp/ki
+        # recommendations without re-running the rotor. None until a test
+        # has produced a usable α/I.
+        self._inertia_last_alpha_per_i = None
+        self._inertia_last_dv          = 0.0
+        self._inertia_last_dt_ms       = 0
+        # Latest K_t reading from 0x2000:1 (Nm/A). Refreshed by the live-poll
+        # timer; stays None until the motor replies at least once. Required
+        # to convert J/K_t into a true J in kg·m².
+        self._inertia_motor_kt         = None
+        # "Did the state machine itself just fire this read?" flags. The
+        # live-poll timer also reads 0x606C — without these we can't tell
+        # a stale poll reply from the reply we're actually waiting for,
+        # and the state machine advances early. Set true right before the
+        # state machine fires its read, cleared after consumption.
+        self._inertia_baseline_pending = False
+        self._inertia_measure_pending  = False
+
+        # Live-readout polling timer (1 Hz) — only when this panel is showing
+        # would be ideal but a 1 Hz read costs nothing.
+        self.inertia_live_timer = QTimer(self)
+        self.inertia_live_timer.setInterval(500)
+        self.inertia_live_timer.timeout.connect(self._inertia_poll_live)
+        self.inertia_live_timer.start()
+
+        return box
+
+    def _inertia_update_bw_hz(self) -> None:
+        try:
+            bw = float(self.inertia_edit_bw.text())
+            self.inertia_lbl_bw_hz.setText(f"{bw/(2*3.14159265):.2f} Hz")
+        except (ValueError, TypeError):
+            self.inertia_lbl_bw_hz.setText("? Hz")
+
+    def _inertia_poll_live(self) -> None:
+        """Refresh the position + velocity readouts at 2 Hz so the operator
+        can confirm "rotor at mech zero, not moving" before starting.
+        Suspends itself while a test is in flight — otherwise a poll's
+        velocity reply could land during BASELINE_V or MEASURE_V and be
+        consumed by the state machine, ending the test microseconds in."""
+        if not self.client.connected: return
+        if self._inertia_state != self._INERTIA_IDLE: return
+        for key in [(0x6064, 0), (0x606C, 0)]:
+            entry = self.od.by_key.get(key)
+            if entry is not None and entry.readable:
+                self.client.read_async(entry)
+
+    def _inertia_status(self, msg: str, err: bool = False) -> None:
+        self.inertia_lbl_status.setText(msg)
+        self.inertia_lbl_status.setStyleSheet(
+            "color:#a00000;font-weight:bold;" if err else "color:#555;font-style:italic;")
+
+    def _inertia_run(self) -> None:
+        """Operator clicked Run. Validate inputs, snapshot state, kick off
+        the state machine. The actual sequencing happens across QTimer
+        callbacks so we don't block the GUI thread."""
+        if self._inertia_state != self._INERTIA_IDLE:
+            self._inertia_status("Already running — wait for it to finish.", err=True)
+            return
+        if not self.client.connected:
+            self._inertia_status("Not connected to CMC.", err=True)
+            return
+        try:
+            self._inertia_i_step    = float(self.inertia_edit_i.text())
+            self._inertia_t_step_ms = int(float(self.inertia_edit_t.text()))
+            self._inertia_bw_rad_s  = float(self.inertia_edit_bw.text())
+        except (ValueError, TypeError):
+            self._inertia_status("Invalid input — check current/duration/bandwidth fields.", err=True)
+            return
+        if not (0.0 < self._inertia_i_step <= 5.0):
+            self._inertia_status("Test current must be in (0, 5] A.", err=True)
+            return
+        if self._inertia_t_step_ms < 10:
+            # Below ~10 ms the SDO round-trip latency dominates the actual
+            # current-on window — measurement gets unreliable.
+            self._inertia_status("Test duration must be at least 10 ms.", err=True)
+            return
+        if not (1.0 <= self._inertia_bw_rad_s <= 1000.0):
+            self._inertia_status("Bandwidth must be in [1, 1000] rad/s.", err=True)
+            return
+
+        # Reset results + read-pending flags so stale state can't carry over.
+        self._inertia_baseline_pending = False
+        self._inertia_measure_pending  = False
+        for lbl in (self.inertia_lbl_alpha, self.inertia_lbl_jkt,
+                    self.inertia_lbl_kp, self.inertia_lbl_ki, self.inertia_lbl_j,
+                    self.inertia_lbl_velocities):
+            lbl.setText("-")
+        self.inertia_btn_run.setEnabled(False)
+        self._inertia_status("Saving current mode...")
+        self._inertia_state = self._INERTIA_SAVE_MODE
+        # Trigger read of 0x3020 axis_op_mode (current mode); completion
+        # arrives via _on_read_done -> _inertia_on_read.
+        entry = self.od.by_key.get((0x3020, 0))
+        if entry is None:
+            self._inertia_abort("OD missing axis_op_mode")
+            return
+        self.client.read_async(entry)
+        # Also kick off a fresh K_t read (0x2000:1 motor_kt_nm_per_a). K_t
+        # is static so we read it once per test rather than polling. The
+        # reply lands in self._inertia_motor_kt via _on_read_done and is
+        # used by _inertia_recompute_recommendations when the test finishes.
+        # No state-machine wait — it'll arrive well before COMPUTE phase.
+        kt_entry = self.od.by_key.get((0x2000, 1))
+        if kt_entry is not None and kt_entry.readable:
+            self.client.read_async(kt_entry)
+
+    def _inertia_abort(self, reason: str) -> None:
+        """Stop the state machine, restore safe state (current=0, mode if
+        we remembered it). Called on any unexpected condition."""
+        self._inertia_state = self._INERTIA_IDLE
+        self._inertia_baseline_pending = False
+        self._inertia_measure_pending  = False
+        self.inertia_btn_run.setEnabled(True)
+        self._inertia_status(f"Aborted: {reason}", err=True)
+        # Best-effort: zero current and restore mode.
+        cur = self.od.by_key.get((0x302B, 0))
+        if cur is not None: self.client.write_async(cur, cur.si_to_raw(0.0))
+        if self._inertia_saved_mode is not None:
+            mode = self.od.by_key.get((0x3020, 0))
+            if mode is not None: self.client.write_async(mode, int(self._inertia_saved_mode))
+
+    def _inertia_advance_after_write(self, next_state: int, delay_ms: int) -> None:
+        """Helper: small delay after issuing a write before advancing — gives
+        the SDO write round-trip time to land before the next read/write."""
+        self._inertia_state = next_state
+        QTimer.singleShot(delay_ms, self._inertia_step)
+
+    def _inertia_step(self) -> None:
+        """State-machine step. Called via QTimer between phases that don't
+        need to wait for a read completion."""
+        s = self._inertia_state
+        if s == self._INERTIA_SET_TORQUE:
+            mode = self.od.by_key.get((0x3020, 0))
+            if mode is None: return self._inertia_abort("axis_op_mode missing")
+            self._inertia_status("Switching to TORQUE mode...")
+            self.client.write_async(mode, MC_AXIS_MODE_TORQUE)
+            # Allow mode change to take effect, then read baseline velocity.
+            self._inertia_advance_after_write(self._INERTIA_BASELINE_V, 100)
+        elif s == self._INERTIA_BASELINE_V:
+            self._inertia_status("Reading baseline velocity...")
+            entry = self.od.by_key.get((0x606C, 0))
+            if entry is None: return self._inertia_abort("velocity_actual missing")
+            self._inertia_baseline_pending = True
+            self.client.read_async(entry)
+            # waits for _inertia_on_read
+        elif s == self._INERTIA_APPLY_I:
+            cur = self.od.by_key.get((0x302B, 0))
+            if cur is None: return self._inertia_abort("axis_target_current missing")
+            self._inertia_status(f"Applying {self._inertia_i_step:.3f} A for {self._inertia_t_step_ms} ms...")
+            self._inertia_t_apply_ms = int(round(time.monotonic() * 1000.0))
+            self.client.write_async(cur, cur.si_to_raw(self._inertia_i_step))
+            # Wait for T_step + small slack (SDO write latency was already
+            # consumed; what we time here is the on-wire duration of the
+            # current). Then read peak velocity.
+            self._inertia_advance_after_write(self._INERTIA_MEASURE_V, self._inertia_t_step_ms)
+        elif s == self._INERTIA_MEASURE_V:
+            # Read velocity FIRST, then zero the current (the zero-write is
+            # fired in _inertia_on_read once the reply lands). Reasoning:
+            # the CMC's SDO queue is serialised, so if we did write-then-read
+            # the motor processes the write first (current → 0), starts
+            # decelerating from friction, and only THEN samples velocity for
+            # our read. Friction decel varies per rev (cogging, bearing
+            # state) so v_peak comes back inconsistent. Reading first
+            # samples velocity while current is still applied → true peak.
+            # Trade-off: current stays on for one extra read round-trip
+            # (~3-5 ms) past our recorded t_measure. For tests >100 ms
+            # that's <5% bias and CONSISTENT (no run-to-run jitter).
+            self._inertia_t_measure_ms = int(round(time.monotonic() * 1000.0))
+            self._inertia_status("Pulse ending — sampling peak velocity...")
+            entry = self.od.by_key.get((0x606C, 0))
+            if entry is None: return self._inertia_abort("velocity_actual missing")
+            self._inertia_measure_pending = True
+            self.client.read_async(entry)
+            # waits for _inertia_on_read, which will fire the zero-current write
+        elif s == self._INERTIA_ZERO_I:
+            # Belt-and-braces: current was already zeroed in MEASURE_V; this
+            # is a second write to guarantee 0 A even if the first packet
+            # was dropped.
+            cur = self.od.by_key.get((0x302B, 0))
+            if cur is None: return self._inertia_abort("axis_target_current missing")
+            self.client.write_async(cur, cur.si_to_raw(0.0))
+            self._inertia_status("Restoring mode...")
+            self._inertia_advance_after_write(self._INERTIA_RESTORE_MODE, 50)
+        elif s == self._INERTIA_RESTORE_MODE:
+            if self._inertia_saved_mode is not None:
+                mode = self.od.by_key.get((0x3020, 0))
+                if mode is not None:
+                    self.client.write_async(mode, int(self._inertia_saved_mode))
+            self._inertia_advance_after_write(self._INERTIA_COMPUTE, 50)
+        elif s == self._INERTIA_COMPUTE:
+            self._inertia_compute_and_display()
+
+    def _inertia_on_read(self, entry: OdEntry, raw: int, si: float) -> None:
+        """Hook called from _on_read_done when an SDO read we're waiting on
+        completes. Advances the state machine accordingly."""
+        s = self._inertia_state
+        if s == self._INERTIA_SAVE_MODE and entry.key == (0x3020, 0):
+            self._inertia_saved_mode = int(raw)
+            self._inertia_state = self._INERTIA_SET_TORQUE
+            QTimer.singleShot(0, self._inertia_step)
+        elif s == self._INERTIA_BASELINE_V and entry.key == (0x606C, 0):
+            # Ignore in-flight poll replies that left before the test started
+            # — only consume the read the state machine itself initiated.
+            if not self._inertia_baseline_pending: return
+            self._inertia_baseline_pending = False
+            self._inertia_v_baseline = float(si)
+            # Begin the actual current step.
+            self._inertia_state = self._INERTIA_APPLY_I
+            QTimer.singleShot(0, self._inertia_step)
+        elif s == self._INERTIA_MEASURE_V and entry.key == (0x606C, 0):
+            if not self._inertia_measure_pending: return
+            self._inertia_measure_pending = False
+            self._inertia_v_peak = float(si)
+            # Kill the current RIGHT NOW — every extra millisecond past this
+            # point means more rotor travel. We're firing this from the read
+            # reply handler (not via QTimer/state step) so it lands on the
+            # CMC's SDO queue with minimum delay.
+            cur = self.od.by_key.get((0x302B, 0))
+            if cur is not None:
+                self.client.write_async(cur, cur.si_to_raw(0.0))
+            self._inertia_state = self._INERTIA_ZERO_I
+            QTimer.singleShot(0, self._inertia_step)
+
+    def _inertia_compute_and_display(self) -> None:
+        """Final phase of the state machine: turn the measured velocity into
+        a plant-gain estimate (α/I), cache it, then delegate the kp/ki
+        recommendation to _inertia_recompute_recommendations so the operator
+        can sweep the bandwidth field afterwards without re-running the rotor."""
+        dv = self._inertia_v_peak - self._inertia_v_baseline
+        dt_s = max(0.001, (self._inertia_t_measure_ms - self._inertia_t_apply_ms) / 1000.0)
+        i = self._inertia_i_step
+        if abs(dv) < 1e-6 or abs(i) < 1e-6:
+            self._inertia_abort(
+                f"No measurable velocity change (Δv={dv:.4f} rad/s over {dt_s*1000:.0f} ms). "
+                "Increase test current or duration; verify motor is enabled and unlocked.")
+            return
+        # Plant gain α/I = (Δω) / (I × T). Units: (rad/s²)/A.
+        alpha_per_i = dv / (i * dt_s)
+        self._inertia_last_alpha_per_i = alpha_per_i
+        self._inertia_last_dv          = dv
+        self._inertia_last_dt_ms       = int(round(dt_s * 1000.0))
+        # Measurement-only fields (don't depend on bandwidth).
+        # Raw velocity samples first — operator cross-checks against the
+        # telemetry graph. Baseline should always be ~0; warn if it isn't
+        # (means the rotor was already moving when Run was pressed).
+        v0_warn = "  ⚠ NON-ZERO!" if abs(self._inertia_v_baseline) > 0.05 else ""
+        self.inertia_lbl_velocities.setText(
+            f"{self._inertia_v_baseline:+.4f}  →  {self._inertia_v_peak:+.4f} rad/s{v0_warn}")
+        jkt = 1.0 / alpha_per_i  # s·A·s/rad
+        self.inertia_lbl_alpha.setText(f"{alpha_per_i:.4g} rad/s² per A")
+        self.inertia_lbl_jkt  .setText(
+            f"{jkt:.4g} s·A·s/rad  (Δv={dv:.4g} rad/s over {self._inertia_last_dt_ms} ms)")
+        self._inertia_state = self._INERTIA_IDLE
+        self.inertia_btn_run.setEnabled(True)
+        # Compute the bandwidth-dependent recommendation; this same method
+        # re-runs whenever the operator edits the bandwidth field.
+        self._inertia_recompute_recommendations()
+        self._inertia_status(
+            "Done. Sweep the bandwidth field above to see the recommendation update live.")
+
+    def _inertia_recompute_recommendations(self) -> None:
+        """Recompute the kp/ki recommendation AND the J display from the
+        cached α/I, the latest K_t poll, and whatever bandwidth is in the
+        field. Called when the test finishes AND whenever the operator
+        edits the bandwidth field — lets them try different bandwidths
+        without re-running the rotor test.
+
+        Standard PI velocity-loop design for a 1/(J·s) plant:
+            kp = ωc / (α/I)        (loop gain = ωc at crossover)
+            ki = kp × ωc / 4       (4:1 pole/zero ratio for phase margin)
+
+        J (kg·m²) = K_t (Nm/A) × (J/K_t) = K_t / (α/I).
+        Needs K_t from motor 0x2000:1 — if it hasn't been read yet the
+        J line stays as "(needs K_t)".
+        """
+        if self._inertia_last_alpha_per_i is None:
+            return  # no test data yet
+        alpha_per_i = self._inertia_last_alpha_per_i
+
+        # J display — independent of bandwidth, only needs K_t.
+        if self._inertia_motor_kt is not None and self._inertia_motor_kt > 0:
+            j = self._inertia_motor_kt / alpha_per_i
+            self.inertia_lbl_j.setText(
+                f"{j:.4g} kg·m²   (K_t={self._inertia_motor_kt:.4g} Nm/A from 0x2000:1)")
+        else:
+            self.inertia_lbl_j.setText("(needs K_t — read 0x2000:1 motor_kt_nm_per_a)")
+
+        # kp/ki — depends on bandwidth.
+        try:
+            bw = float(self.inertia_edit_bw.text())
+        except (ValueError, TypeError):
+            self.inertia_lbl_kp.setText("? (invalid bandwidth)")
+            self.inertia_lbl_ki.setText("? (invalid bandwidth)")
+            return
+        if not (1.0 <= bw <= 1000.0):
+            self.inertia_lbl_kp.setText("? (bandwidth out of range [1,1000])")
+            self.inertia_lbl_ki.setText("?")
+            return
+        kp = bw / alpha_per_i if alpha_per_i != 0 else 0.0
+        ki = kp * bw / 4.0
+        self.inertia_lbl_kp.setText(f"{kp:.4g}")
+        self.inertia_lbl_ki.setText(f"{ki:.4g}")
 
     def _build_motorcfg_actions(self) -> QWidget:
         box = QGroupBox("Calibration")
@@ -1847,6 +2831,9 @@ class MainWindow(QMainWindow):
 
     def _on_read_done(self, res: dict) -> None:
         entry: OdEntry = res["entry"]
+        if res.get("ok") and isinstance(res.get("si"), (int, float)):
+            self._mcfg_vals[entry.key] = float(res["si"])   # feed the bandwidth estimates
+            self._mcfg_update_bw()
         item = self.item_by_key.get(entry.key)
         is_probe = getattr(self, "_probe_key", None) == entry.key
         # Forward to a config tab (CMC Setup or Motor Config) if either owns this
@@ -1864,7 +2851,8 @@ class MainWindow(QMainWindow):
             else:
                 self._mcfg_status[entry.key].setText(f"<{res.get('error', 'error')}>")
         # Motor Command tab: route axis/motor state read-backs to the command labels.
-        if (entry.key in _CMD_STATE_KEYS or entry.key in _MCFG_READOUT_KEYS) and res.get("ok"):
+        if (entry.key in _CMD_STATE_KEYS or entry.key in _MCFG_READOUT_KEYS
+                or entry.key in _CMD_READOUT_KEYS) and res.get("ok"):
             self._cmd_on_state_read(res)
         # Motor Config tab: route LED-colour read-backs (0x3060/61/62) into the
         # sliders so "Read LED" pulls the live values from the CMC.
@@ -1874,6 +2862,26 @@ class MainWindow(QMainWindow):
                 self._led_on_read(ch, int(res["raw"]))
             except (KeyError, TypeError, ValueError):
                 pass
+        # Inertia estimator: routes velocity + op_mode reads that the
+        # estimator state machine is waiting on, AND keeps the panel's
+        # pre-test live readouts (pos / vel) updated.
+        if res.get("ok") and hasattr(self, "_inertia_state"):
+            if entry.key == (0x6064, 0):
+                self.inertia_lbl_pos.setText(f"{res['si']:+.4f} rad")
+            elif entry.key == (0x606C, 0):
+                self.inertia_lbl_vel.setText(f"{res['si']:+.4f} rad/s")
+            elif entry.key == (0x2000, 1):
+                # Cache K_t so the inertia display can convert J/K_t -> J.
+                # If a test has already completed, refresh the J line so it
+                # picks up the new K_t reading without re-running.
+                self._inertia_motor_kt = float(res["si"])
+                if self._inertia_last_alpha_per_i is not None:
+                    self._inertia_recompute_recommendations()
+            if self._inertia_state not in (self._INERTIA_IDLE, self._INERTIA_DONE):
+                try:
+                    self._inertia_on_read(entry, int(res["raw"]), float(res["si"]))
+                except Exception as e:  # noqa: BLE001 — never let the SM crash the GUI
+                    self._inertia_abort(f"internal: {e}")
         if res.get("ok"):
             text = entry.format_value(res["raw"])
             if item:
@@ -1919,6 +2927,13 @@ class MainWindow(QMainWindow):
 
     def _on_write_done(self, res: dict) -> None:
         entry: OdEntry = res["entry"]
+        # The joystick raw setpoint (0x3026) streams ~40 Hz and bypasses TX logging — keep its write-ACKs
+        # out of the console (else a 40 Hz flood) and skip the confirm-readback, but DO surface failures
+        # (e.g. OD queue full) so a silently-failing stream is visible.
+        if entry.index == 0x3026:
+            if not res.get("ok"):
+                self._log(f"WRITE {entry.label} FAILED: {res.get('error', 'error')}", "WARN")
+            return
         if self._cfg_row(entry.key) is not None:
             self._setup_on_write_done(entry, bool(res.get("ok")),
                                       res.get("error", "error"))
@@ -1941,12 +2956,17 @@ class MainWindow(QMainWindow):
     def _poll_watched(self) -> None:
         if not self.client.connected:
             return
-        for key, item in self.item_by_key.items():
-            if item.checkState(_WATCH_COL) == Qt.CheckState.Checked:
-                entry = self.od.by_key.get(key)
-                if entry and entry.readable:
-                    self.client.read_async(entry)
-        self._cmd_poll_state()   # refresh the Motor Command tab's live state
+        # Round-robin one watched OD-tree read per cycle (not all at once) — same OD-queue back-pressure
+        # reason as _cmd_poll_state below. Telemetry-graphed values stream separately; this is for the
+        # acyclic watch column.
+        watched = [k for k, item in self.item_by_key.items()
+                   if item.checkState(_WATCH_COL) == Qt.CheckState.Checked]
+        if watched:
+            self._watch_rr = (getattr(self, "_watch_rr", -1) + 1) % len(watched)
+            entry = self.od.by_key.get(watched[self._watch_rr])
+            if entry is not None and entry.readable:
+                self.client.read_async(entry)
+        self._cmd_poll_state()   # refresh the Motor Command tab's live state (also round-robined)
 
     # === telemetry map ========================================================
     def _selected_map_entries(self) -> list[OdEntry]:

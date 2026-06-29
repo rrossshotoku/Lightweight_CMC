@@ -147,10 +147,10 @@ def test_gui_build(model):
     gw2._redraw()                     # manual-view path (reads viewRange)
     gw2.close()
 
-    # Motor Config tab: config rows registered for the gain/model/profile keys,
+    # Motor Config tab: config rows registered for the gain/model keys,
     # and the cal/store status entries routed to their labels.
     assert win._mcfg_rows, "Motor Config rows not built"
-    for key in [(0x2000, 1), (0x2300, 1), (0x2400, 5), (0x2500, 6), (0x6081, 0), (0x2700, 3),
+    for key in [(0x2000, 1), (0x2300, 1), (0x2400, 5), (0x2500, 6), (0x2700, 3),
                 (0x2200, 4)]:  # velocity_ff_gain (ADR-031)
         assert key in win._mcfg_rows, f"Motor Config missing row {key}"
     assert (0x2700, 2) in win._mcfg_status and (0x2800, 2) in win._mcfg_status

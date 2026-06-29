@@ -230,9 +230,13 @@ typedef enum
     X(0x2300, 4, vel_current_limit_a,         MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2300, 5, vel_load_factor,             MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     /* Velocity-demand acceleration ramp (ADR-042): slew the PROFILE_VELOCITY (joystick) demand toward the \
-       setpoint at this acceleration. accel_up while speeding up, accel_dn while slowing down [rad/s^2]. 0 = off. */ \
+       setpoint under an acceleration cap -- accel_up [rad/s^2] while speeding up, accel_dn while slowing down \
+       (0 = that phase disabled). accel_jerk [rad/s^3] eases the acceleration UP to the cap; the acceleration \
+       falls FREELY on the way down (no knob), which is what keeps it from overshooting. accel_jerk 0 = step. \
+       Operator-facing (joystick feel): the CMC should expose these in its joystick config UI as proxied motor writes. */ \
     X(0x2300, 6, vel_accel_up,                MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2300, 7, vel_accel_dn,                MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    X(0x2300, 8, vel_accel_jerk,              MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2310, 1, tlm_vel_demand_rad_s,        MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2310, 2, tlm_vel_actual_rad_s,        MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2310, 3, tlm_vel_iq_cmd_a,            MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
@@ -260,6 +264,9 @@ typedef enum
     X(0x2500, 4, est_obs_ki,                  MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2500, 5, est_obs_kv,                  MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2500, 6, est_use_observer,            MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    /* Observer output low-pass coefficient (0..1, first-order at the 1 kHz estimator rate; ~57 Hz at 0.3). \
+       This filters the velocity the loops use when use_observer=1 -- NOT velocity_filter_hz (ADR-003). */ \
+    X(0x2500, 7, est_obs_filter_alpha,        MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2510, 1, tlm_mech_position_rad,       MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2510, 2, tlm_mech_velocity_rad_s,     MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2510, 3, tlm_pos_demand_rad,          MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
@@ -275,6 +282,10 @@ typedef enum
        targets + stops the velocity demand at them + sets AT_LIMIT_LO/HI. lo >= hi = disabled. */ \
     X(0x2600, 6, pos_limit_lo_rad,            MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2600, 7, pos_limit_hi_rad,            MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    /* Jerk-limited S-curve trajectory planner (ADR-045): max_jerk_rad_s3 = the fixed system jerk [rad/s^3]; \
+       traj_use_scurve = 1 selects the S-curve planner for PROFILE_POSITION moves, 0 = trapezoidal (default). */ \
+    X(0x2600, 8, max_jerk_rad_s3,             MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    X(0x2600, 9, traj_use_scurve,             MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     /* --- 0x2700 calibration --- */ \
     X(0x2700, 1, cal_command,                 MC_IF_T_U16, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     X(0x2700, 2, cal_status,                  MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
@@ -290,6 +301,14 @@ typedef enum
     X(0x2900, 2, inject_target,               MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     X(0x2900, 3, inject_step_amplitude,       MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     X(0x2900, 4, inject_step_trigger,         MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    /* Debug DAC (PA4 / DAC1_OUT1) source select: 0=|iq| 1=iq 2=|id| 3=id 4=ia 5=ib 6=ic 7=i_max 8=i_arm. */ \
+    X(0x2900, 5, dac_source,                  MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    /* d-axis voltage-step plant ID (ADR-046): open-loop Vd at a fixed electrical angle, fired from the PC \
+       tool. dq_test_enable=1 applies dq_test_voltage_v (clamped +/-3 V) at dq_test_angle_rad; auto-disarms. */ \
+    X(0x2900, 6, dq_test_voltage_v,           MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    X(0x2900, 7, dq_test_angle_rad,           MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    X(0x2900, 8, dq_test_enable,              MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    X(0x2900, 9, dq_test_dwell_ms,            MC_IF_T_U16, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     /* --- 0x2910 loop-tuning test-signal overlay (ADR-030; amplitude/rate units follow test_mode) --- */ \
     X(0x2910, 1, test_mode,                   MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     X(0x2910, 2, test_amplitude,              MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
@@ -301,6 +320,20 @@ typedef enum
     X(0x2910, 8, test_signal,                 MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2910, 9, test_pause_s,                MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     X(0x2910, 10, test_max_accel,             MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    /* --- 0x2920 stepped-sine current sweep for resonance / frequency-response ID (ADR-047) --- */ \
+    X(0x2920, 1, freq_sweep_start_hz,         MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    X(0x2920, 2, freq_sweep_end_hz,           MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    X(0x2920, 3, freq_sweep_step_hz,          MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    X(0x2920, 4, freq_sweep_dwell_s,          MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    X(0x2920, 5, freq_sweep_bias_a,           MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    X(0x2920, 6, freq_sweep_amplitude_a,      MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    X(0x2920, 7, freq_sweep_enable,           MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    X(0x2920, 8, freq_sweep_current_hz,       MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
+    X(0x2920, 9, freq_sweep_active,           MC_IF_T_U8,  MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    /* --- 0x2930 current-command notch filter (resonance suppression, ADR-048) --- */ \
+    X(0x2930, 1, notch_enable,                MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    X(0x2930, 2, notch_freq_hz,               MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    X(0x2930, 3, notch_bandwidth_hz,          MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     /* --- 0x2A00 telemetry map: sub0 = count; sub1..16 are U32 map entries (array) --- */ \
     X(0x2A00, 0, tlm_map_count,               MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     /* === CMC-owned axis_manager entries (axis 0). Reserve 0x3100-0x31FF for axis 1, etc. === */ \

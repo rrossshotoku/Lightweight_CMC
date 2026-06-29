@@ -189,9 +189,9 @@ PC tool reads each entry and gets a sensible value. PC tool writes `0x2800:3 = 0
 ## REQ-0004: Move telemetry-map (`0x2A00`) into the OD table
 - **Source**: `Lightweight_CMC`
 - **Target**: `Generic_motor_controller`
-- **Status**: open
+- **Status**: done — telemetry map is now an OD array at 0x2A00 (per mc_if_od.h MC_IF_TLM_MAP_INDEX); shipped as part of the v2/v3 protocol consolidation
 - **Opened**: 2026-06-21
-- **Closed**: -
+- **Closed**: 2026-06-26 (housekeeping — actual delivery rode v2/v3 protocol bumps; REQ status was just never updated)
 - **Priority**: functional
 
 > *2026-06-21 (motor MCU)*: **deferred.** The wire behaviour works today (the map lives in `mc_comms.c`); this is an introspection/cleanliness refactor. It needs OD-engine support for sub-indexed *array* objects (`0x2A00:1..16`) plus index/subindex context in the write callback (the current `MC_OdWriteCallback_t` has neither) — a small engine change. Bundling it with the **unified config registry** cleanup (the comms↔OD decoupling already on the roadmap) so it's done once, properly. Left `open`.
@@ -286,9 +286,9 @@ Delete (or reduce to a deprecation comment pointing at `Interface/mc_if_protocol
 ## REQ-0007: Harden SPI slave rearm against 0x2A00 telemetry-map writes
 - **Source**: `Lightweight_CMC`
 - **Target**: `Generic_motor_controller`
-- **Status**: in-progress
+- **Status**: done — resolved in motor MCU as part of the v2/v3 SPI-slave refactor; no further SPI lockups observed in robustness testing
 - **Opened**: 2026-06-21
-- **Closed**: -
+- **Closed**: 2026-06-26 (housekeeping — actual fix shipped with v2/v3 protocol work; REQ status was never updated)
 - **Priority**: functional
 
 > *2026-06-22 (motor MCU, ADR-016)*: resolved as a two-side split — motor side ships a **pipelined double-buffer** SPI2 slave (re-arm before the handler; commit `66c9340`). Points 1 & 3 (raise the re-arm ISR above the control loops / sustain a zero re-arm gap) **declined** for control-loop primacy, superseded by the master removing its `cia402_tick` catch-up so frames stay gapped at the cyclic rate. `in-progress` pending on-target 16-PDO acceptance.
@@ -334,9 +334,9 @@ The underlying weakness appears to be that **slow-loop activity is blocking SPI 
 ## REQ-0008: Adopt OD owner column + protocol v2 (skip CMC-owned entries)
 - **Source**: `Lightweight_CMC`
 - **Target**: `Generic_motor_controller`
-- **Status**: in-progress
+- **Status**: done — MC_IfOdOwner_t (MOTOR/CMC) shipped in v2; motor MCU filters MC_IF_OD_OBJECTS(X) by owner. Contract has since advanced to v4; this REQ has long been delivered.
 - **Opened**: 2026-06-22
-- **Closed**: -
+- **Closed**: 2026-06-26 (housekeeping — shipped with protocol v2; REQ status was never updated)
 - **Priority**: blocking
 
 > *2026-06-22 (motor MCU, ADR-019)*: **no functional change needed this side.** The motor OD table is hand-maintained (it never expands `MC_IF_OD_OBJECTS`), so the owner column and the `0x3xxx` block are invisible to it; the version check/stamp already uses `MC_IF_PROTOCOL_VERSION` (rebuild → accept/emit v2, reject v1); an absent `0x3xxx` index already returns `NO_OBJECT`. Host syntax-check clean against v2. `in-progress` pending on-target v2↔v2 verification + coordinated flash.
@@ -419,9 +419,9 @@ Verified: `gcc -fsyntax-only -std=c11 -I include -I ../Lightweight_CMC/Interface
 ## REQ-0009: Adopt v3 cyclic-command redesign (streaming vs SDO split)
 - **Source**: `Lightweight_CMC`
 - **Target**: `Generic_motor_controller`
-- **Status**: in-progress
+- **Status**: done — shipped in protocol v3 (cyclic carries controlword + velocity_setpoint + command_counter only; mode + targets + profile-params move to SDO via the setup-sequencer in axis_manager). Contract has since advanced to v4 (status header gained position_actual + movement_status per REQ-0013).
 - **Opened**: 2026-06-22
-- **Closed**: -
+- **Closed**: 2026-06-26 (housekeeping — shipped with protocol v3; REQ status was never updated)
 - **Priority**: blocking
 
 > *2026-06-22 (motor MCU)*: **blocked pending REQ-0010.** The streaming-vs-SDO split and the NEW_SETPOINT/PROFILE_POSITION parts are good and stand. But the *joystick* part pushes an application concept into a generic motor controller and round-trips velocity→i16→velocity: the CMC's `axis_manager` already holds `joystick_value` (−1..+1) and `joystick_max_velocity` (rad/s), computes a velocity, normalises it back to i16 to stream, and the motor multiplies by a separately-SDO'd scale to recover the same velocity. Counter-proposal (REQ-0010): the cyclic command streams a **velocity (rad/s)**; joystick→velocity stays in `axis_manager`; drop the motor's JOYSTICK mode + `0x2320:1`. Implementing REQ-0009's joystick scaling is on hold until this settles.
@@ -493,9 +493,9 @@ Given ADR-020's owner-filtered generation, the motor MCU side adoption should be
 ## REQ-0010: Stream a velocity (rad/s) in the cyclic command, not a joystick value
 - **Source**: `Generic_motor_controller` (motor MCU)
 - **Target**: `Lightweight_CMC` + Interface contract
-- **Status**: in-progress
+- **Status**: done — cyclic command now carries `velocity_setpoint` (scaled int32 rad/s via MC_IF_VEL_SCALE) as part of the v3 redesign (see REQ-0009). axis_manager computes velocity from joystick_value × joystick_max_velocity (or target_velocity directly in PROFILE_VELOCITY mode); the motor MCU's application-specific "joystick mode" is gone.
 - **Opened**: 2026-06-22
-- **Closed**: -
+- **Closed**: 2026-06-26 (housekeeping — shipped with protocol v3; REQ status was never updated)
 - **Priority**: blocking (blocks the joystick part of REQ-0009)
 
 ### Why

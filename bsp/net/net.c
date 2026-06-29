@@ -189,6 +189,38 @@ void net_close(net_sock_t sock)
     (void)close((uint8_t)sock);
 }
 
+/* Graceful TCP shutdown — issues Sn_CR_DISCON (FIN) and returns
+ * immediately. The W6100 internally waits for the TX buffer to drain,
+ * sends FIN, waits for the peer's FIN-ACK, then transitions through
+ * FIN_WAIT/TIME_WAIT to CLOSED. Caller polls net_tcp_state() and
+ * reopens once SOCK_CLOSED. The slot is unavailable for re-listen
+ * during the FIN exchange (~tens of ms typical, longer if the peer
+ * is slow).
+ *
+ * Use this instead of net_close() when the response data MUST flush
+ * to the wire before the socket dies — Sn_CR_CLOSE (immediate hard
+ * close) would drop any TX bytes not yet transmitted. This was the
+ * fix for the web's "POST returned ok but the body got truncated /
+ * next request hung" bug.
+ *
+ * The ioLibrary's disconnect() spins until SOCK_CLOSED; we deliberately
+ * don't use that on the cooperative super-loop — poke Sn_CR ourselves
+ * and let the W6100 progress in the background. */
+void net_tcp_graceful_close(net_sock_t sock)
+{
+    if (!valid_sock(sock)) return;
+    /* DISCON only meaningful in ESTABLISHED; any other state falls back
+     * to a hard close so we don't leak the slot. */
+    if (net_tcp_state(sock) != NET_TCP_ESTABLISHED) {
+        (void)close((uint8_t)sock);
+        return;
+    }
+    setSn_CR((uint8_t)sock, Sn_CR_DISCON);
+    /* Wait for the command-accept ack only (microseconds, NOT the
+     * FIN/ACK round-trip). */
+    while (getSn_CR((uint8_t)sock)) { /* spin briefly */ }
+}
+
 /*----------------------------------------------------------------------------
  * TCP
  *---------------------------------------------------------------------------*/

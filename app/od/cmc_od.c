@@ -384,13 +384,21 @@ static MC_IfOdResult_t cmc_od_write_inner(uint16_t idx, uint8_t sub,
      * REQ-0014. Operator-tunable load is now motor-owned at 0x2300:5
      * vel_load_factor; CMC web slider writes there directly via SDO.) */
 
-    /* --- 0x3050 cmc_save_config: write MC_IF_SAVE_MAGIC to commit --- */
+    /* --- 0x3050 cmc_save_config: write MC_IF_SAVE_MAGIC to commit ---
+     * Two-side save: CMC's own persist (axis_persist blob — joystick cal,
+     * motion limits, LED) AND the motor's flash (load_factor, vel_accel_*,
+     * brushed gains, etc.). The motor-side save runs ASYNC through the
+     * axis_manager sequencer (disable -> wait -> SDO -> re-enable, ~500 ms
+     * total). We return OK as soon as the CMC-side save succeeds — the
+     * motor save logs its own success in the debug stream and the operator
+     * sees the motor briefly disabled. */
     case 0x3050:
         sz = check_write_size(MC_IF_T_U16, in_len); if (sz != MC_IF_OD_OK) return sz;
         if (in_type != MC_IF_T_U16)            return MC_IF_OD_ERR_TYPE;
         if (get_u16(in_data) != MC_IF_SAVE_MAGIC) return MC_IF_OD_ERR_RANGE;
-        return axis_manager_save_to_flash() ? MC_IF_OD_OK
-                                            : MC_IF_OD_ERR_CALLBACK;
+        if (!axis_manager_save_to_flash()) return MC_IF_OD_ERR_CALLBACK;
+        (void)axis_manager_request_motor_save();   /* fire-and-forget */
+        return MC_IF_OD_OK;
 
     /* --- 0x3051 cmc_save_shots: write MC_IF_SAVE_MAGIC to commit --- */
     case 0x3051:

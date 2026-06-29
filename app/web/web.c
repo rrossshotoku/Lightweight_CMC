@@ -349,12 +349,16 @@ static void build_config_json(void)
      * + decimal + NUL). */
     char b_vel[24], b_plo[24], b_phi[24], b_acc[24];
     char b_jmax[24], b_load[24];
+    char b_aup[24], b_adn[24], b_ajk[24];
     const char *s_vel  = fmt_f32(axis_manager_get_velocity_limit(),      b_vel,  sizeof(b_vel));
     const char *s_plo  = fmt_f32(axis_manager_get_position_limit_lo(),   b_plo,  sizeof(b_plo));
     const char *s_phi  = fmt_f32(axis_manager_get_position_limit_hi(),   b_phi,  sizeof(b_phi));
     const char *s_acc  = fmt_f32(axis_manager_get_accel_limit(),         b_acc,  sizeof(b_acc));
     const char *s_jmax = fmt_f32(axis_manager_get_joystick_max_velocity(),b_jmax,sizeof(b_jmax));
     const char *s_load = fmt_f32(axis_manager_get_load_factor(),         b_load, sizeof(b_load));
+    const char *s_aup  = fmt_f32(axis_manager_get_vel_accel_up(),        b_aup,  sizeof(b_aup));
+    const char *s_adn  = fmt_f32(axis_manager_get_vel_accel_dn(),        b_adn,  sizeof(b_adn));
+    const char *s_ajk  = fmt_f32(axis_manager_get_vel_accel_jerk(),      b_ajk,  sizeof(b_ajk));
 
     int n = snprintf(s_tx_buf, sizeof(s_tx_buf),
         "{"
@@ -368,7 +372,10 @@ static void build_config_json(void)
             "\"netmask\":\"%u.%u.%u.%u\","
             "\"gateway\":\"%u.%u.%u.%u\","
             "\"cmc_device_no\":%lu,"
-            "\"tcp_camerad_port\":%u"
+            "\"tcp_camerad_port\":%u,"
+            "\"panel_a_ip\":\"%u.%u.%u.%u\","
+            "\"panel_b_port\":%u,"
+            "\"panel_b_ip\":\"%u.%u.%u.%u\""
           "},"
           "\"limits\":{"
             "\"velocity\":%s,"
@@ -382,7 +389,10 @@ static void build_config_json(void)
             "\"raw_full_pos\":%ld,"
             "\"raw_full_neg\":%ld,"
             "\"raw_deadband\":%lu,"
-            "\"raw_current\":%ld"
+            "\"raw_current\":%ld,"
+            "\"vel_accel_up\":%s,"
+            "\"vel_accel_dn\":%s,"
+            "\"vel_accel_jerk\":%s"
           "},"
           "\"dynamics\":{"
             "\"load_factor\":%s"
@@ -396,6 +406,9 @@ static void build_config_json(void)
         net->gateway[0], net->gateway[1], net->gateway[2], net->gateway[3],
         (unsigned long)net->cmc_device_no,
         (unsigned)net->tcp_camerad_port,
+        net->panel_a_ip[0], net->panel_a_ip[1], net->panel_a_ip[2], net->panel_a_ip[3],
+        (unsigned)net->panel_b_port,
+        net->panel_b_ip[0], net->panel_b_ip[1], net->panel_b_ip[2], net->panel_b_ip[3],
         s_vel, s_plo, s_phi, s_acc,
         s_jmax,
         (long)axis_manager_get_joystick_raw_center(),
@@ -403,6 +416,7 @@ static void build_config_json(void)
         (long)axis_manager_get_joystick_raw_full_neg(),
         (unsigned long)axis_manager_get_joystick_raw_deadband(),
         (long)axis_manager_get_joystick_raw(),
+        s_aup, s_adn, s_ajk,
         s_load);
 
     if (n < 0 || (size_t)n >= sizeof(s_tx_buf)) {
@@ -438,10 +452,9 @@ static void apply_config_json(const char *json)
             if (parse_u32(p, &v) && v >= 1u && v <= 255u) cfg.cmc_device_no = v;
         }
 
-        /* tcp_camerad_port — CAMERAD TCP listener (advertised to panels as
-         * return_port). Takes effect after reboot (listen socket is opened
-         * once in controller_mgr_init). Accept the IANA dynamic range plus
-         * the canonical 30001; reject < 1024 (privileged) and > 65535. */
+        /* tcp_camerad_port — CAMERAD TCP listener A (advertised to panel_a_ip
+         * as return_port). Takes effect after reboot. Accept the IANA
+         * dynamic range; reject < 1024 (privileged) and > 65535. */
         p = find_key(net, "tcp_camerad_port");
         if (p) {
             uint32_t v;
@@ -449,6 +462,27 @@ static void apply_config_json(const char *json)
                 cfg.tcp_camerad_port = (uint16_t)v;
             }
         }
+
+        /* panel_a_ip — expected source IP for panel A's POLLs. 0.0.0.0
+         * disables slot A (strict mode — no listener opened). */
+        p = find_key(net, "panel_a_ip");
+        if (p) (void)parse_ip_quoted(p, cfg.panel_a_ip);
+
+        /* panel_b_port — listener for panel B. 0 leaves the previous value
+         * (so panel B can be enabled by setting just the IP if a default
+         * port is acceptable). Otherwise same validation as A. */
+        p = find_key(net, "panel_b_port");
+        if (p) {
+            uint32_t v;
+            if (parse_u32(p, &v) && (v == 0u || (v >= 1024u && v <= 65535u))) {
+                cfg.panel_b_port = (uint16_t)v;
+            }
+        }
+
+        /* panel_b_ip — expected source IP for panel B's POLLs. 0.0.0.0
+         * disables slot B. */
+        p = find_key(net, "panel_b_ip");
+        if (p) (void)parse_ip_quoted(p, cfg.panel_b_ip);
 
         (void)config_set_network(&cfg);
     }
@@ -472,6 +506,12 @@ static void apply_config_json(const char *json)
         if ((p = find_key(js, "raw_full_pos")) && parse_i32(p, &i)) (void)axis_manager_set_joystick_raw_full_pos(i);
         if ((p = find_key(js, "raw_full_neg")) && parse_i32(p, &i)) (void)axis_manager_set_joystick_raw_full_neg(i);
         if ((p = find_key(js, "raw_deadband")) && parse_u32(p, &u)) (void)axis_manager_set_joystick_raw_deadband(u);
+        /* vel_accel_up/dn/jerk — motor-owned (0x2300:6/7/8); axis_manager
+         * caches locally + fires SDO write. Persisted on motor flash via
+         * the motor-save sequencer kicked off by cmc_save_config. */
+        if ((p = find_key(js, "vel_accel_up"))   && parse_f32(p, &f)) (void)axis_manager_set_vel_accel_up(f);
+        if ((p = find_key(js, "vel_accel_dn"))   && parse_f32(p, &f)) (void)axis_manager_set_vel_accel_dn(f);
+        if ((p = find_key(js, "vel_accel_jerk")) && parse_f32(p, &f)) (void)axis_manager_set_vel_accel_jerk(f);
     }
 
     /* dynamics — load_factor writes through to motor 0x2300:5 via SDO
@@ -567,8 +607,15 @@ static void handle_save(void)
 {
     bool ok1 = axis_manager_save_to_flash();
     bool ok2 = config_save_network_to_flash();
-    if (ok1 && ok2) send_text_ok("ok");
-    else            send_500("flash save failed");
+    if (ok1 && ok2) {
+        send_text_ok("ok");
+        /* Also kick off the motor-side save (disable -> SDO 0x2800:1 -> re-enable).
+         * Fire-and-forget; runs over multiple ticks in axis_manager. Operator
+         * sees the motor briefly disabled after the HTTP response. */
+        (void)axis_manager_request_motor_save();
+    } else {
+        send_500("flash save failed");
+    }
 }
 
 static void handle_reboot(void)
@@ -636,9 +683,20 @@ static void reopen_listen(void)
 
 static void close_connection(void)
 {
-    net_close(WEB_SOCKET);
+    /* Graceful close (Sn_CR_DISCON): the W6100 drains its TX buffer
+     * before sending FIN, so the full response actually reaches the
+     * wire. A plain net_close() (Sn_CR_CLOSE) would drop anything
+     * still queued — for small responses (POST's 2-byte "ok") that
+     * meant browsers saw 200 OK headers with no body and the
+     * subsequent GET hung. This was the build that fixed the user-
+     * visible "load failed: TypeError: failed to fetch" toast.
+     *
+     * Slot doesn't immediately return to LISTEN — it goes through
+     * FIN_WAIT → TIME_WAIT → CLOSED in the background (~tens of ms).
+     * service_connection's CLOSED/CLOSE_WAIT/OTHER branch then
+     * reopens listen cleanly. */
+    net_tcp_graceful_close(WEB_SOCKET);
     s_req_len = 0;
-    reopen_listen();
 }
 
 static void service_connection(void)
@@ -646,13 +704,12 @@ static void service_connection(void)
     net_tcp_state_t st = net_tcp_state(WEB_SOCKET);
     bool up = (st == NET_TCP_ESTABLISHED);
 
-    /* (Per-connection log removed — the page polls /api/config every 2 s
-     * with Connection: close, generating one TCP handshake per poll. The
-     * resulting noise drowns the real event signal. The first-ever boot
-     * "web: ready on :80" line below covers "is the server alive".) */
     s_listener_up_prev = up;
 
-    if (st == NET_TCP_CLOSED || st == NET_TCP_CLOSE_WAIT) {
+    /* Reopen on ANY non-listening, non-established state. */
+    if (st == NET_TCP_CLOSED ||
+        st == NET_TCP_CLOSE_WAIT ||
+        st == NET_TCP_OTHER) {
         reopen_listen();
         return;
     }

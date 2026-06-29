@@ -178,6 +178,49 @@ bool   axis_manager_set_accel_limit                  (float v);      /* 0x3033 *
 float  axis_manager_get_load_factor                  (void);
 bool   axis_manager_set_load_factor                  (float v);
 
+/* --- Velocity-demand accel ramp (motor-owned 0x2300:6/7/8, CHANGELOG [4.5.0]) ---
+ * Joystick-feel parameters: the motor slews its PROFILE_VELOCITY demand
+ * toward the live setpoint under acceleration caps. accel_up rad/s² while
+ * speeding up, accel_dn rad/s² while slowing down; accel_jerk rad/s³
+ * eases the acceleration UP to the cap (smoother start, no overshoot at
+ * the end since it falls freely). 0 disables that phase (default).
+ *
+ * Same proxy pattern as load_factor: setter caches locally + fires an
+ * ad-hoc SDO write to the motor; getter returns the cache (no SDO read
+ * round-trip per web GET). NOT persisted on the CMC side — these are
+ * stored in the motor's flash via the motor-save sequencer kicked off by
+ * cmc_save_config. */
+float  axis_manager_get_vel_accel_up                 (void);
+bool   axis_manager_set_vel_accel_up                 (float rad_s2);
+float  axis_manager_get_vel_accel_dn                 (void);
+bool   axis_manager_set_vel_accel_dn                 (float rad_s2);
+float  axis_manager_get_vel_accel_jerk               (void);
+bool   axis_manager_set_vel_accel_jerk               (float rad_s3);
+
+/* --- Motor-save sequencer ---
+ * Kicks off the disable -> wait -> SDO save -> wait -> re-enable sequence
+ * that persists motor-owned settings (load_factor, vel_accel_*, brushed
+ * gains, position cal, etc.) to the motor's flash. The motor can only
+ * commit a save while the power stage is OFF (ADR-010) so axis_manager
+ * brackets the SDO write with disable + re-enable. Re-enable is gated on
+ * the pre-save enable state — operators who had the motor intentionally
+ * disabled don't suddenly find it re-enabled.
+ *
+ * Non-blocking: returns immediately, runs across multiple ticks. Total
+ * wall-clock ~500 ms (disable settle + flash erase/program + re-enable).
+ * Returns false if another save is already in flight. */
+bool   axis_manager_request_motor_save               (void);
+
+/* Trigger an immediate re-read of every proxied motor entry into the CMC
+ * cache. Used when the operator (or another tool — PC, OD-over-UDP, etc.)
+ * may have written motor OD directly without going through axis_manager,
+ * leaving the CMC cache stale. Runs across multiple ticks in the
+ * background; cache is fully refreshed within ~50 ms typical. No-op if
+ * a resync is already in flight. The same state machine also re-fires
+ * automatically every 5 s, so manual triggers are an optimisation, not
+ * a requirement. */
+void   axis_manager_request_motor_resync             (void);
+
 #ifdef __cplusplus
 }
 #endif

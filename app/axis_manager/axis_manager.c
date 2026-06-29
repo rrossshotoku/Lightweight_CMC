@@ -144,6 +144,12 @@ typedef struct {
      * GET responses + fire an ad-hoc SDO write so the motor adopts it
      * for its velocity loop. Persisted by the motor MCU, not by us. */
     float            load_factor;
+    /* Motor-proxied velocity-demand accel ramp (motor's 0x2300:6/7/8).
+     * Cached locally so the web GET doesn't need an SDO read round-trip;
+     * the motor's flash is authoritative (persisted via motor-save sequencer). */
+    float            vel_accel_up_rad_s2;
+    float            vel_accel_dn_rad_s2;
+    float            vel_accel_jerk_rad_s3;
 
     /* Cached from the v4 cyclic status header (REQ-0013/ADR-033). The
      * motor MCU now puts position + a movement-status bitfield in the
@@ -198,6 +204,15 @@ static uint8_t s_new_setpoint_remaining;
  * sustain HALT here. Few-cycle pulse for robust edge detection. */
 #define HALT_PULSE_CYCLES           3u
 static uint8_t s_halt_remaining;
+
+/* FAULT_RESET pulse — same shape and same reason as NEW_SETPOINT / HALT.
+ * Holding the bit for 3 cycles guarantees that at least one of those
+ * cycles is actually transmitted to the motor as a cyclic_cmd frame
+ * (rather than getting interleaved with cia402 OD traffic and lost),
+ * which is what made "Clear Fault" reliably require two presses with
+ * the previous single-cycle pulse. */
+#define FAULT_RESET_PULSE_CYCLES    3u
+static uint8_t s_fault_reset_remaining;
 
 /*----------------------------------------------------------------------------
  * Scaling helpers
@@ -411,6 +426,7 @@ void axis_manager_init(void)
     s_seq_handle           = CIA402_OD_HANDLE_INVALID;
     s_new_setpoint_remaining = 0;
     s_halt_remaining         = 0;
+    s_fault_reset_remaining  = 0;
 
     /* Attempt to load persisted config from flash. On success this
      * overrides the coded defaults above; on failure (uninitialised
@@ -656,9 +672,16 @@ static void compose_cyclic_cmd(MC_IfCyclicCommand_t *out)
     uint16_t cw = 0;
 
     /* Clear-fault: rising edge for one cycle. */
+    /* Latch the request into the multi-cycle pulse counter; hold the bit
+     * for FAULT_RESET_PULSE_CYCLES so it's reliably seen by the motor
+     * even if cia402 is interleaving OD traffic for some of those cycles. */
     if (s_axis.clear_fault_pulse) {
-        cw |= MC_IF_CW_FAULT_RESET;
+        s_fault_reset_remaining  = FAULT_RESET_PULSE_CYCLES;
         s_axis.clear_fault_pulse = false;
+    }
+    if (s_fault_reset_remaining > 0) {
+        cw |= MC_IF_CW_FAULT_RESET;
+        s_fault_reset_remaining--;
     }
 
     /* Quick-stop: clear QUICK_STOP bit and force-disable. */
@@ -667,6 +690,7 @@ static void compose_cyclic_cmd(MC_IfCyclicCommand_t *out)
         s_axis.quick_stop_pulse  = false;
         s_new_setpoint_remaining = 0;   /* abandon any pending trigger */
         s_halt_remaining         = 0;   /* abandon any pending HALT pulse */
+        s_fault_reset_remaining  = 0;   /* abandon any pending fault-reset pulse */
         out->controlword         = cw;     /* QUICK_STOP bit cleared = quick-stop active */
         return;
     }
@@ -735,6 +759,26 @@ static void compose_cyclic_cmd(MC_IfCyclicCommand_t *out)
 /* Defined further down in the load-factor accessor block. Forward-declared
  * here so axis_manager_tick can drain the pending SDO write each cycle. */
 static void poll_load_factor_sdo(void);
+/* Forward decls for the proxy + motor-save sequencer (defined right after
+ * load_factor). Both run every tick to keep their state machines alive.
+ * proxy_motor_f32_begin is also forward-declared so the limit-setters
+ * higher up in the file can call it. */
+static void poll_motor_proxy_sdo(void);
+static void tick_motor_save(void);
+static void tick_proxy_bootsync(void);
+static bool proxy_motor_f32_begin(uint32_t slot_idx, float v);
+
+/* Proxy slot indices — keep in sync with the s_proxy_slots[] table further
+ * down. Defined here (above the limit-setters that reference them) because
+ * the table itself lives near the proxy machinery, far below. */
+#define PROXY_SLOT_VEL_ACCEL_UP    (0u)
+#define PROXY_SLOT_VEL_ACCEL_DN    (1u)
+#define PROXY_SLOT_VEL_ACCEL_JERK  (2u)
+#define PROXY_SLOT_VEL_LIMIT       (3u)
+#define PROXY_SLOT_ACCEL_LIMIT     (4u)
+#define PROXY_SLOT_POS_LIMIT_LO    (5u)
+#define PROXY_SLOT_POS_LIMIT_HI    (6u)
+#define PROXY_SLOT_COUNT           (7u)
 
 /*----------------------------------------------------------------------------
  * TORQUE-mode current jog from on-board UP/DOWN buttons
@@ -851,10 +895,17 @@ void axis_manager_tick(void)
          * or a parsed telemetry-blob entry. Not blocking any current feature. */
     }
 
-    /* 2. Drain any pending ad-hoc SDO writes (load_factor) so they release
-     * cia402's OD slot — has to happen BEFORE the setup-sequencer tries
-     * to issue its own writes, otherwise the slot stays held by us. */
+    /* 2. Drain any pending ad-hoc SDO writes so they release cia402's OD
+     * slot — has to happen BEFORE the setup-sequencer tries to issue its
+     * own writes, otherwise the slot stays held by us.
+     * load_factor has its own dedicated handle/pending tracking (legacy);
+     * the new vel_accel_* + motor-save sequencer share a single proxy
+     * handle (only one of the three can be in flight at a time, which is
+     * fine because they're operator-driven and low-rate). */
     poll_load_factor_sdo();
+    tick_proxy_bootsync();   /* reads first (no-op once complete) */
+    poll_motor_proxy_sdo();  /* writes second (round-robin across dirty slots) */
+    tick_motor_save();
 
     /* 3. Sample the on-board UP/DOWN buttons. In TORQUE mode this drives
      * target_current_a; the next step (sequencer) will pick up the new
@@ -1042,12 +1093,23 @@ bool  axis_manager_set_button_current(float amps)
  * Limits
  *---------------------------------------------------------------------------*/
 
+/* Translate a CMC-side position limit (which may be +/-INFINITY meaning
+ * "unset / no limit") to the value the motor expects at 0x2600:6/7. The
+ * motor treats `lo >= hi` as disabled; we map any non-finite value to
+ * 0.0, so if either side is unset they'll both end up at 0 and the
+ * motor disables enforcement. */
+static float finite_or_zero(float v) { return isfinite(v) ? v : 0.0f; }
+
 float axis_manager_get_velocity_limit(void) { return s_axis.velocity_limit_rad_s; }
 bool  axis_manager_set_velocity_limit(float v)
 {
     if (v < 0.0f || isnan(v)) return false;
     s_axis.velocity_limit_rad_s = v;
-    return true;
+    /* Motor enforces its own envelope at 0x2600:4. 0 = disabled per motor
+     * CHANGELOG [4.5.0]; we forward the operator's value as-is (0 from
+     * the operator just disables motor-side enforcement, CMC-side
+     * clamping still happens via compute_desired). */
+    return proxy_motor_f32_begin(PROXY_SLOT_VEL_LIMIT, v);
 }
 
 float axis_manager_get_position_limit_lo(void) { return s_axis.position_limit_lo_rad; }
@@ -1055,7 +1117,7 @@ bool  axis_manager_set_position_limit_lo(float v)
 {
     if (isnan(v)) return false;
     s_axis.position_limit_lo_rad = v;
-    return true;
+    return proxy_motor_f32_begin(PROXY_SLOT_POS_LIMIT_LO, finite_or_zero(v));
 }
 
 float axis_manager_get_position_limit_hi(void) { return s_axis.position_limit_hi_rad; }
@@ -1063,7 +1125,7 @@ bool  axis_manager_set_position_limit_hi(float v)
 {
     if (isnan(v)) return false;
     s_axis.position_limit_hi_rad = v;
-    return true;
+    return proxy_motor_f32_begin(PROXY_SLOT_POS_LIMIT_HI, finite_or_zero(v));
 }
 
 float axis_manager_get_accel_limit(void) { return s_axis.accel_limit_rad_s2; }
@@ -1071,7 +1133,9 @@ bool  axis_manager_set_accel_limit(float v)
 {
     if (v < 0.0f || isnan(v)) return false;
     s_axis.accel_limit_rad_s2 = v;
-    return true;
+    /* Motor enforces its own envelope at 0x2600:5; same semantics as
+     * the velocity-limit case. */
+    return proxy_motor_f32_begin(PROXY_SLOT_ACCEL_LIMIT, v);
 }
 
 /* Load factor — see header. Set fires an SDO write to motor 0x2300:5
@@ -1143,6 +1207,409 @@ static void poll_load_factor_sdo(void)
     }
     s_load_factor_handle  = CIA402_OD_HANDLE_INVALID;
     s_load_factor_pending = false;
+}
+
+/*----------------------------------------------------------------------------
+ * Generic motor-proxy SDO write (used for vel_accel_up/dn/jerk and the
+ * motor-save magic write). Mirrors the load_factor pattern but shared
+ * across all proxied entries with a SMALL DIRTY QUEUE so back-to-back
+ * setters (e.g. apply_config_json doing set_up + set_dn + set_jerk in
+ * one POST) don't drop writes when the cia402 OD pipeline is busy with
+ * the first one. Each (idx, sub) slot has its own dirty flag + cached
+ * value; the tick polls completion of the current in-flight, then
+ * advances to the next dirty slot if any.
+ *---------------------------------------------------------------------------*/
+typedef struct {
+    uint16_t    idx;
+    uint8_t     sub;
+    const char *name;
+    float       value;     /* most-recent value the setter recorded */
+    bool        dirty;     /* true if motor's flash differs from this cache (needs SDO) */
+} motor_proxy_slot_t;
+
+/* PROXY_SLOT_* macros defined near the top of the file (forward-decl
+ * area) because the limit-setters far above reference them. The table
+ * here is the canonical mapping of slot index -> (idx, sub, name). */
+static motor_proxy_slot_t s_proxy_slots[PROXY_SLOT_COUNT] = {
+    [PROXY_SLOT_VEL_ACCEL_UP]   = { 0x2300u, 6u, "vel_accel_up",    0.0f, false },
+    [PROXY_SLOT_VEL_ACCEL_DN]   = { 0x2300u, 7u, "vel_accel_dn",    0.0f, false },
+    [PROXY_SLOT_VEL_ACCEL_JERK] = { 0x2300u, 8u, "vel_accel_jerk",  0.0f, false },
+    [PROXY_SLOT_VEL_LIMIT]      = { 0x2600u, 4u, "max_velocity",    0.0f, false },
+    [PROXY_SLOT_ACCEL_LIMIT]    = { 0x2600u, 5u, "max_accel",       0.0f, false },
+    [PROXY_SLOT_POS_LIMIT_LO]   = { 0x2600u, 6u, "pos_limit_lo",    0.0f, false },
+    [PROXY_SLOT_POS_LIMIT_HI]   = { 0x2600u, 7u, "pos_limit_hi",    0.0f, false },
+};
+
+/* In-flight tracking. At most one SDO active at a time (cia402 limit). */
+static cia402_od_handle_t s_proxy_handle      = CIA402_OD_HANDLE_INVALID;
+static bool               s_proxy_pending     = false;
+static uint32_t           s_proxy_inflight_slot = 0;     /* index into s_proxy_slots */
+
+/* Mark a slot dirty + cache its value. Does NOT issue the SDO directly —
+ * poll_motor_proxy_sdo() will pick it up on the next tick that finds the
+ * pipeline free. This is what lets three back-to-back setters survive
+ * the cia402 OD bottleneck: all three slots end up dirty, the tick drains
+ * them one at a time. */
+static bool proxy_motor_f32_begin(uint32_t slot_idx, float v)
+{
+    if (slot_idx >= PROXY_SLOT_COUNT) return false;
+    motor_proxy_slot_t *s = &s_proxy_slots[slot_idx];
+    s->value = v;
+    s->dirty = true;
+    LOG_INFO("axis_manager: %s queued = %d/1000 (motor 0x%04X:%u)",
+             s->name, (int)(v * 1000.0f),
+             (unsigned)s->idx, (unsigned)s->sub);
+    return true;
+}
+
+/* Drain a completed proxy SDO (if any) and, if the pipeline is free,
+ * fire the next dirty slot. Called from axis_manager_tick. */
+static void poll_motor_proxy_sdo(void)
+{
+    /* Step 1: drain any in-flight SDO completion. */
+    if (s_proxy_pending) {
+        MC_IfOdResult_t res = MC_IF_OD_OK;
+        uint8_t buf[8] = {0};
+        uint8_t vlen   = sizeof(buf);
+        if (!cia402_od_poll(s_proxy_handle, &res, buf, &vlen)) return;
+        motor_proxy_slot_t *inflight = &s_proxy_slots[s_proxy_inflight_slot];
+        if (res == MC_IF_OD_OK) {
+            LOG_INFO("axis_manager: %s SDO -> motor 0x%04X:%u OK",
+                     inflight->name, (unsigned)inflight->idx, (unsigned)inflight->sub);
+        } else {
+            LOG_WARN("axis_manager: %s SDO -> motor 0x%04X:%u FAIL result=0x%02X",
+                     inflight->name, (unsigned)inflight->idx, (unsigned)inflight->sub,
+                     (unsigned)res);
+        }
+        s_proxy_handle  = CIA402_OD_HANDLE_INVALID;
+        s_proxy_pending = false;
+        /* Fall through — pipeline is now free, can start next dirty slot. */
+    }
+
+    /* Step 2: find next dirty slot and start its SDO. Round-robin from
+     * the last in-flight slot so heavy traffic on one entry doesn't
+     * starve the others. */
+    for (uint32_t i = 0; i < PROXY_SLOT_COUNT; ++i) {
+        uint32_t slot_idx = (s_proxy_inflight_slot + 1u + i) % PROXY_SLOT_COUNT;
+        motor_proxy_slot_t *s = &s_proxy_slots[slot_idx];
+        if (!s->dirty) continue;
+        cia402_od_handle_t h = cia402_od_write_begin(
+            s->idx, s->sub, MC_IF_T_F32, &s->value, sizeof(float));
+        if (h == CIA402_OD_HANDLE_INVALID) {
+            /* cia402 still busy (e.g. load_factor or setup_sequencer write
+             * in flight). Try again next tick. */
+            return;
+        }
+        s->dirty               = false;
+        s_proxy_handle         = h;
+        s_proxy_pending        = true;
+        s_proxy_inflight_slot  = slot_idx;
+        LOG_INFO("axis_manager: %s -> motor 0x%04X:%u = %d/1000 (SDO h=%d)",
+                 s->name, (unsigned)s->idx, (unsigned)s->sub,
+                 (int)(s->value * 1000.0f), (int)h);
+        return;
+    }
+}
+
+/*----------------------------------------------------------------------------
+ * vel_accel_up / vel_accel_dn / vel_accel_jerk (motor 0x2300:6/7/8)
+ *---------------------------------------------------------------------------*/
+
+#define MOTOR_OD_VEL_GAINS_IDX        (0x2300u)
+#define MOTOR_OD_VEL_ACCEL_UP_SUB     (6u)
+#define MOTOR_OD_VEL_ACCEL_DN_SUB     (7u)
+#define MOTOR_OD_VEL_ACCEL_JERK_SUB   (8u)
+
+float axis_manager_get_vel_accel_up  (void) { return s_axis.vel_accel_up_rad_s2;   }
+float axis_manager_get_vel_accel_dn  (void) { return s_axis.vel_accel_dn_rad_s2;   }
+float axis_manager_get_vel_accel_jerk(void) { return s_axis.vel_accel_jerk_rad_s3; }
+
+bool axis_manager_set_vel_accel_up(float v)
+{
+    if (isnan(v) || v < 0.0f) return false;
+    s_axis.vel_accel_up_rad_s2 = v;
+    return proxy_motor_f32_begin(PROXY_SLOT_VEL_ACCEL_UP, v);
+}
+bool axis_manager_set_vel_accel_dn(float v)
+{
+    if (isnan(v) || v < 0.0f) return false;
+    s_axis.vel_accel_dn_rad_s2 = v;
+    return proxy_motor_f32_begin(PROXY_SLOT_VEL_ACCEL_DN, v);
+}
+bool axis_manager_set_vel_accel_jerk(float v)
+{
+    if (isnan(v) || v < 0.0f) return false;
+    s_axis.vel_accel_jerk_rad_s3 = v;
+    return proxy_motor_f32_begin(PROXY_SLOT_VEL_ACCEL_JERK, v);
+}
+
+/*----------------------------------------------------------------------------
+ * Motor-proxy bootsync — SDO-read each accel param on first start so the
+ * CMC's cache (and therefore the web UI) reflects the motor's actual
+ * flash values rather than the firmware default of 0. Runs once after
+ * cia402 is initialised and link is up; each slot reads one at a time
+ * because the cia402 OD pipeline serialises. Skips a slot whose dirty
+ * flag is set (the operator already typed a value the proxy is trying
+ * to write — don't clobber it with the stale motor value).
+ *---------------------------------------------------------------------------*/
+typedef enum {
+    BOOTSYNC_IDLE = 0,    /* not started yet */
+    BOOTSYNC_BUSY,        /* an SDO read is in flight */
+    BOOTSYNC_DONE,        /* all slots synced (or skipped) — sequencer retires */
+} bootsync_state_t;
+
+static bootsync_state_t   s_bootsync_state         = BOOTSYNC_IDLE;
+static cia402_od_handle_t s_bootsync_handle        = CIA402_OD_HANDLE_INVALID;
+static uint32_t           s_bootsync_inflight_slot = 0;
+static uint32_t           s_bootsync_next_slot     = 0;
+static uint32_t           s_bootsync_start_ms      = 0;
+
+#define BOOTSYNC_KICKOFF_DELAY_MS  500u   /* let cia402 + motor settle before pinging */
+/* Periodic auto-resync — re-read all proxied motor entries every N ms so the
+ * CMC cache picks up changes a PC tool (or any other writer) made directly
+ * to the motor's OD without going through axis_manager's setters. Without
+ * this, the web UI shows stale values after a PC-tool-initiated change.
+ * 5 s is a balance between freshness and SDO traffic (7 reads × ~5 ms each
+ * = ~35 ms of pipeline time per resync, so 0.7% utilization at this rate). */
+#define BOOTSYNC_RESYNC_PERIOD_MS  5000u
+static uint32_t s_bootsync_last_done_ms;
+
+/* Restart the resync state machine: forget completion, start reading from
+ * slot 0 again. Public so other modules (e.g. web on demand) can trigger
+ * an immediate refresh. No-op if a resync is already in flight. */
+void axis_manager_request_motor_resync(void)
+{
+    if (s_bootsync_state != BOOTSYNC_DONE) return;  /* already running */
+    s_bootsync_state     = BOOTSYNC_IDLE;
+    s_bootsync_next_slot = 0;
+    /* Skip the kickoff delay on restart — only the first-ever boot needs
+     * it (motor was still settling). After that, motor is up. */
+    s_bootsync_start_ms  = time_ms() - BOOTSYNC_KICKOFF_DELAY_MS;
+}
+
+static void tick_proxy_bootsync(void)
+{
+    /* Auto-restart every BOOTSYNC_RESYNC_PERIOD_MS once the previous pass
+     * completed. Lets the CMC cache track motor-side changes without any
+     * external trigger. */
+    if (s_bootsync_state == BOOTSYNC_DONE) {
+        if (time_elapsed_ms(s_bootsync_last_done_ms) >= BOOTSYNC_RESYNC_PERIOD_MS) {
+            axis_manager_request_motor_resync();
+        } else {
+            return;
+        }
+    }
+
+    /* Wait a beat after init before kicking off — the motor MCU's SPI
+     * link is still settling and the first SDO often gets dropped if
+     * fired too early. Once we've started, the state machine drives. */
+    if (s_bootsync_state == BOOTSYNC_IDLE) {
+        if (s_bootsync_start_ms == 0u) s_bootsync_start_ms = time_ms();
+        if (time_elapsed_ms(s_bootsync_start_ms) < BOOTSYNC_KICKOFF_DELAY_MS) return;
+    }
+
+    /* Drain completed read, if any. */
+    if (s_bootsync_state == BOOTSYNC_BUSY) {
+        MC_IfOdResult_t res = MC_IF_OD_OK;
+        uint8_t buf[8] = {0};
+        uint8_t vlen   = sizeof(buf);
+        if (!cia402_od_poll(s_bootsync_handle, &res, buf, &vlen)) return;
+
+        motor_proxy_slot_t *s = &s_proxy_slots[s_bootsync_inflight_slot];
+        if (res == MC_IF_OD_OK && vlen == sizeof(float)) {
+            float v;
+            memcpy(&v, buf, sizeof(float));
+            /* Don't clobber the cache if the operator already typed a new
+             * value (slot was marked dirty before we got here). Otherwise
+             * adopt the motor's flash value and mirror into s_axis. */
+            if (!s->dirty) {
+                /* Only log when the value actually changes — periodic
+                 * resync would otherwise spam unchanged values every
+                 * BOOTSYNC_RESYNC_PERIOD_MS. */
+                bool changed = (s->value != v);
+                s->value = v;
+                switch (s_bootsync_inflight_slot) {
+                case PROXY_SLOT_VEL_ACCEL_UP:   s_axis.vel_accel_up_rad_s2   = v; break;
+                case PROXY_SLOT_VEL_ACCEL_DN:   s_axis.vel_accel_dn_rad_s2   = v; break;
+                case PROXY_SLOT_VEL_ACCEL_JERK: s_axis.vel_accel_jerk_rad_s3 = v; break;
+                case PROXY_SLOT_VEL_LIMIT:      s_axis.velocity_limit_rad_s  = v; break;
+                case PROXY_SLOT_ACCEL_LIMIT:    s_axis.accel_limit_rad_s2    = v; break;
+                /* Motor's 0 means "disabled" — translate back to CMC's +/-INF
+                 * convention so the CMC-side clamping in compute_desired
+                 * remains permissive (no clamp) until the operator sets a
+                 * real value. */
+                case PROXY_SLOT_POS_LIMIT_LO:
+                    s_axis.position_limit_lo_rad = (v == 0.0f) ? -INFINITY : v;
+                    break;
+                case PROXY_SLOT_POS_LIMIT_HI:
+                    s_axis.position_limit_hi_rad = (v == 0.0f) ? +INFINITY : v;
+                    break;
+                default: break;
+                }
+                if (changed) {
+                    LOG_INFO("axis_manager: motor-resync %s = %d/1000 (from motor 0x%04X:%u)",
+                             s->name, (int)(v * 1000.0f),
+                             (unsigned)s->idx, (unsigned)s->sub);
+                }
+            } else {
+                LOG_INFO("axis_manager: motor-resync %s skipped (already dirty — operator set value first)",
+                         s->name);
+            }
+        } else {
+            LOG_WARN("axis_manager: bootsync %s read FAIL result=0x%02X vlen=%u",
+                     s->name, (unsigned)res, (unsigned)vlen);
+        }
+        s_bootsync_handle = CIA402_OD_HANDLE_INVALID;
+        s_bootsync_state  = BOOTSYNC_IDLE;   /* fall through to start next */
+    }
+
+    /* Issue next read if there's one outstanding. */
+    if (s_bootsync_next_slot >= PROXY_SLOT_COUNT) {
+        if (s_bootsync_state != BOOTSYNC_DONE) {
+            s_bootsync_state = BOOTSYNC_DONE;
+            s_bootsync_last_done_ms = time_ms();
+            /* Only log the very first completion — periodic resyncs would
+             * spam this every BOOTSYNC_RESYNC_PERIOD_MS. The individual
+             * per-slot value lines above are still rate-limited by being
+             * inside the success branch. */
+            static bool s_logged_once;
+            if (!s_logged_once) {
+                s_logged_once = true;
+                LOG_INFO("axis_manager: bootsync complete — motor values mirrored into CMC cache (will auto-resync every %u ms)",
+                         (unsigned)BOOTSYNC_RESYNC_PERIOD_MS);
+            }
+        }
+        return;
+    }
+    motor_proxy_slot_t *s = &s_proxy_slots[s_bootsync_next_slot];
+    cia402_od_handle_t h = cia402_od_read_begin(s->idx, s->sub, MC_IF_T_F32);
+    if (h == CIA402_OD_HANDLE_INVALID) return;  /* cia402 busy — retry next tick */
+    s_bootsync_handle        = h;
+    s_bootsync_inflight_slot = s_bootsync_next_slot;
+    s_bootsync_state         = BOOTSYNC_BUSY;
+    s_bootsync_next_slot++;
+}
+
+/*----------------------------------------------------------------------------
+ * Motor-save sequencer
+ *
+ * Motor MCU can only commit a save while the power stage is OFF (motor
+ * ADR-010 / CHANGELOG [4.2.0] store_status PENDING bit). To save without
+ * an operator-visible "save pending" state, axis_manager wraps the SDO
+ * write to 0x2800:1 = MC_IF_SAVE_MAGIC with controlword disable +
+ * re-enable. Re-enable is gated on the pre-save enable state — operators
+ * who had the motor intentionally disabled don't suddenly find it
+ * re-enabled by a config save.
+ *
+ * State machine, advanced each tick by tick_motor_save():
+ *   IDLE         nothing in progress
+ *   DISABLING    enable_latch cleared; waiting MOTOR_SAVE_DISABLE_MS for the
+ *                statusword to actually drop the ENABLED bit on the wire
+ *   WRITING_SDO  SDO write of SAVE_MAGIC to 0x2800:1 in flight
+ *   REENABLE     write completed; re-enable enable_latch if it was set
+ *                pre-save; back to IDLE
+ *
+ * Total wall-clock ~300-500 ms typical (disable settle + flash erase
+ * + flash program + re-enable). Non-blocking — runs across many ticks.
+ *---------------------------------------------------------------------------*/
+#define MOTOR_SAVE_DISABLE_MS         250u   /* time for power stage to actually be OFF */
+#define MOTOR_SAVE_OVERALL_TIMEOUT_MS 5000u  /* sequencer aborts if it can't finish in this long */
+
+typedef enum {
+    MOTOR_SAVE_IDLE = 0,
+    MOTOR_SAVE_DISABLING,
+    MOTOR_SAVE_WRITING_SDO,
+    MOTOR_SAVE_REENABLE,
+} motor_save_state_t;
+
+static motor_save_state_t s_motor_save_state    = MOTOR_SAVE_IDLE;
+static uint32_t           s_motor_save_phase_ms = 0;
+static uint32_t           s_motor_save_start_ms = 0;
+static bool               s_motor_save_was_enabled = false;
+static cia402_od_handle_t s_motor_save_handle      = CIA402_OD_HANDLE_INVALID;
+
+bool axis_manager_request_motor_save(void)
+{
+    if (s_motor_save_state != MOTOR_SAVE_IDLE) {
+        LOG_WARN("axis_manager: motor save requested but sequencer already busy (state=%d)",
+                 (int)s_motor_save_state);
+        return false;
+    }
+    s_motor_save_was_enabled = s_axis.enable_latch;
+    s_motor_save_start_ms    = time_ms();
+    s_motor_save_phase_ms    = s_motor_save_start_ms;
+
+    LOG_INFO("axis_manager: motor save START (was_enabled=%d) — disabling for %u ms",
+             (int)s_motor_save_was_enabled, (unsigned)MOTOR_SAVE_DISABLE_MS);
+    s_axis.enable_latch = false;   /* take effect next compose_cyclic_cmd */
+    s_motor_save_state  = MOTOR_SAVE_DISABLING;
+    return true;
+}
+
+static void tick_motor_save(void)
+{
+    if (s_motor_save_state == MOTOR_SAVE_IDLE) return;
+
+    if (time_elapsed_ms(s_motor_save_start_ms) > MOTOR_SAVE_OVERALL_TIMEOUT_MS) {
+        LOG_ERROR("axis_manager: motor save TIMEOUT after %u ms (state=%d) — aborting, restoring enable_latch=%d",
+                  (unsigned)MOTOR_SAVE_OVERALL_TIMEOUT_MS,
+                  (int)s_motor_save_state, (int)s_motor_save_was_enabled);
+        s_axis.enable_latch = s_motor_save_was_enabled;
+        s_motor_save_state  = MOTOR_SAVE_IDLE;
+        s_motor_save_handle = CIA402_OD_HANDLE_INVALID;
+        return;
+    }
+
+    switch (s_motor_save_state) {
+    case MOTOR_SAVE_DISABLING: {
+        if (time_elapsed_ms(s_motor_save_phase_ms) < MOTOR_SAVE_DISABLE_MS) return;
+        /* Disable settle window elapsed — start the SDO write. If the
+         * cia402 OD pipeline is busy with something else (e.g. a
+         * load_factor or vel_accel proxy), try again next tick. */
+        uint16_t magic = MC_IF_SAVE_MAGIC;
+        cia402_od_handle_t h = cia402_od_write_begin(
+            0x2800u, 1u, MC_IF_T_U16, &magic, sizeof(magic));
+        if (h == CIA402_OD_HANDLE_INVALID) return;
+        s_motor_save_handle   = h;
+        s_motor_save_state    = MOTOR_SAVE_WRITING_SDO;
+        s_motor_save_phase_ms = time_ms();
+        LOG_INFO("axis_manager: motor save WRITE 0x2800:1 = 0x%04X (SDO h=%d)",
+                 (unsigned)MC_IF_SAVE_MAGIC, (int)h);
+        break;
+    }
+    case MOTOR_SAVE_WRITING_SDO: {
+        MC_IfOdResult_t res = MC_IF_OD_OK;
+        uint8_t buf[8] = {0};
+        uint8_t vlen   = sizeof(buf);
+        if (!cia402_od_poll(s_motor_save_handle, &res, buf, &vlen)) return;
+        if (res == MC_IF_OD_OK) {
+            LOG_INFO("axis_manager: motor save SDO accepted (motor wrote to flash)");
+        } else {
+            LOG_WARN("axis_manager: motor save SDO FAIL result=0x%02X "
+                     "(motor refused — drive may still be enabled?)", (unsigned)res);
+        }
+        s_motor_save_handle = CIA402_OD_HANDLE_INVALID;
+        s_motor_save_state  = MOTOR_SAVE_REENABLE;
+        s_motor_save_phase_ms = time_ms();
+        break;
+    }
+    case MOTOR_SAVE_REENABLE: {
+        /* Brief grace period before re-enabling, so the motor's
+         * statusword has time to stabilise after the save. */
+        if (time_elapsed_ms(s_motor_save_phase_ms) < 50u) return;
+        if (s_motor_save_was_enabled) {
+            s_axis.enable_latch = true;
+            LOG_INFO("axis_manager: motor save DONE — re-enabling axis (was enabled pre-save)");
+        } else {
+            LOG_INFO("axis_manager: motor save DONE — leaving disabled (was disabled pre-save)");
+        }
+        s_motor_save_state = MOTOR_SAVE_IDLE;
+        break;
+    }
+    default:
+        s_motor_save_state = MOTOR_SAVE_IDLE;
+        break;
+    }
 }
 
 /*----------------------------------------------------------------------------

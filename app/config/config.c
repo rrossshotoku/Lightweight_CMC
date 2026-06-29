@@ -18,21 +18,31 @@ static uint8_t        s_node_id;
 
 /* On-flash network blob. Only the operator-tunable subset is persisted.
  * Bump NETWORK_PERSIST_VERSION on any layout change so stale blobs are
- * rejected by persist_load (caller falls back to coded defaults). */
-#define NETWORK_PERSIST_VERSION  1u
+ * rejected by persist_load (caller falls back to coded defaults).
+ *
+ * v2 (2026-06-26): added panel_a_ip + panel_b_port + panel_b_ip for the
+ * two-panel IP-pinned routing scheme (controller_mgr opens up to two TCP
+ * listeners, one per (port, expected-source-IP) pair). Boards with a v1
+ * blob in flash fall through to coded defaults at next boot — operator
+ * must re-Save once after upgrade to recover their custom IP. Struct
+ * grew 32 -> 48 B; persist region (2 KB) has plenty of room. */
+#define NETWORK_PERSIST_VERSION  2u
 #define NETWORK_PERSIST_MAGIC    0x4E455457u    /* "NETW" little-endian */
 
 typedef struct __attribute__((packed)) {
-    uint32_t magic;            /*  4 */
-    uint8_t  ip[4];            /*  4 */
-    uint8_t  netmask[4];       /*  4 */
-    uint8_t  gateway[4];       /*  4 */
-    uint32_t cmc_device_no;    /*  4 — advertised to panels as return_device_no */
-    uint32_t tcp_camerad_port; /*  4 — advertised to panels as return_port; 0 = use compile-time default (no-version-bump migration from v1 blobs where this slot was reserved=0) */
-    uint32_t reserved[2];      /*  8 — room for two more u32s without a version bump */
-} network_persist_blob_t;      /* total: 32 */
+    uint32_t magic;             /*  4 */
+    uint8_t  ip[4];             /*  4 */
+    uint8_t  netmask[4];        /*  4 */
+    uint8_t  gateway[4];        /*  4 */
+    uint32_t cmc_device_no;     /*  4 — advertised to panels as return_device_no */
+    uint32_t tcp_camerad_port;  /*  4 — panel A listen port, advertised as return_port to panel_a_ip */
+    uint8_t  panel_a_ip[4];     /*  4 — expected source IP for panel A; 0.0.0.0 = slot disabled */
+    uint32_t panel_b_port;      /*  4 — panel B listen port, advertised as return_port to panel_b_ip; 0 = slot disabled */
+    uint8_t  panel_b_ip[4];     /*  4 — expected source IP for panel B; 0.0.0.0 = slot disabled */
+    uint32_t reserved[3];       /* 12 — room for three more u32s without another version bump */
+} network_persist_blob_t;       /* total: 48 */
 
-_Static_assert(sizeof(network_persist_blob_t) == 32,
+_Static_assert(sizeof(network_persist_blob_t) == 48,
                "network_persist_blob_t layout drift");
 
 void config_init(void)
@@ -46,7 +56,15 @@ void config_init(void)
     s_network.netmask[0] = 255; s_network.netmask[1] = 255; s_network.netmask[2] = 255; s_network.netmask[3] = 0;
     s_network.gateway[0] = 192; s_network.gateway[1] =   1; s_network.gateway[2] = 0; s_network.gateway[3] = 1;
     s_network.udp_poll_port    = 30002;
-    s_network.tcp_camerad_port = 30001;     /* CAMERAD TCP listener — port 30001 matches SW050 (NetComms.c LISTENPORT1) so existing S/T panels and tools that target the canonical CAMERAD listen port reach us. Was 30003 (Reduced CMC's value) — moved to 30001 on 2026-06-26 for SW050 compatibility. NOT in the persisted blob, so the default takes effect on next boot with no operator save needed. The CMC still opens outbound TCP from a dynamic port (10000 + slot) to each panel's return_port for push responses; that path is unaffected. */
+    s_network.tcp_camerad_port = 30001;     /* Panel A default port (matches SW050 LISTENPORT1) */
+    s_network.panel_b_port     = 30004;     /* Panel B default port (different from A so two listen slots can coexist on different W6100 sockets) */
+    /* Both panel IPs default to 0.0.0.0 — strict mode means neither listener
+     * comes up until the operator configures real IPs via the web UI. This is
+     * deliberate (Option A): a fresh board with no config doesn't open any
+     * CAMERAD inbound sockets, so no random network device can connect.
+     * Operator workflow: web -> Network -> set panel IPs -> Save -> Reboot. */
+    memset(s_network.panel_a_ip, 0, sizeof(s_network.panel_a_ip));
+    memset(s_network.panel_b_ip, 0, sizeof(s_network.panel_b_ip));
     s_network.http_port        = 80;
     s_network.od_udp_port      = 5000;
     s_network.log_tcp_port     = 30200;
@@ -67,17 +85,24 @@ void config_init(void)
         memcpy(s_network.netmask, blob.netmask, 4);
         memcpy(s_network.gateway, blob.gateway, 4);
         s_network.cmc_device_no = blob.cmc_device_no;
-        /* tcp_camerad_port = 0 in flash means "v1 blob predating this field"
-         * (it was reserved=0 before — see struct comment). Fall through to
-         * the compile-time default in that case so the operator doesn't have
-         * to re-save after an upgrade. Any non-zero value overrides. */
         if (blob.tcp_camerad_port != 0u && blob.tcp_camerad_port <= 0xFFFFu) {
             s_network.tcp_camerad_port = (uint16_t)blob.tcp_camerad_port;
         }
-        LOG_INFO("config: network loaded from flash (ip=%u.%u.%u.%u tcp=%u dev=%lu)",
+        memcpy(s_network.panel_a_ip, blob.panel_a_ip, 4);
+        if (blob.panel_b_port <= 0xFFFFu) {
+            s_network.panel_b_port = (uint16_t)blob.panel_b_port;
+        }
+        memcpy(s_network.panel_b_ip, blob.panel_b_ip, 4);
+        LOG_INFO("config: network loaded from flash (ip=%u.%u.%u.%u dev=%lu)",
                  s_network.ip[0], s_network.ip[1], s_network.ip[2], s_network.ip[3],
-                 (unsigned)s_network.tcp_camerad_port,
                  (unsigned long)s_network.cmc_device_no);
+        LOG_INFO("config: panel A: ip=%u.%u.%u.%u port=%u  panel B: ip=%u.%u.%u.%u port=%u",
+                 s_network.panel_a_ip[0], s_network.panel_a_ip[1],
+                 s_network.panel_a_ip[2], s_network.panel_a_ip[3],
+                 (unsigned)s_network.tcp_camerad_port,
+                 s_network.panel_b_ip[0], s_network.panel_b_ip[1],
+                 s_network.panel_b_ip[2], s_network.panel_b_ip[3],
+                 (unsigned)s_network.panel_b_port);
     } else {
         LOG_INFO("config: network using factory defaults");
     }
@@ -152,14 +177,23 @@ bool config_save_network_to_flash(void)
     memcpy(blob.gateway, s_network.gateway, 4);
     blob.cmc_device_no    = s_network.cmc_device_no;
     blob.tcp_camerad_port = (uint32_t)s_network.tcp_camerad_port;
+    memcpy(blob.panel_a_ip, s_network.panel_a_ip, 4);
+    blob.panel_b_port     = (uint32_t)s_network.panel_b_port;
+    memcpy(blob.panel_b_ip, s_network.panel_b_ip, 4);
 
     bool ok = persist_save(PERSIST_REGION_NETWORK, &blob, sizeof(blob),
                            NETWORK_PERSIST_VERSION);
     if (ok) {
-        LOG_INFO("config: network saved to flash (ip=%u.%u.%u.%u tcp=%u dev=%lu)",
+        LOG_INFO("config: network saved to flash (ip=%u.%u.%u.%u dev=%lu)",
                  s_network.ip[0], s_network.ip[1], s_network.ip[2], s_network.ip[3],
-                 (unsigned)s_network.tcp_camerad_port,
                  (unsigned long)s_network.cmc_device_no);
+        LOG_INFO("config: panel A: ip=%u.%u.%u.%u port=%u  panel B: ip=%u.%u.%u.%u port=%u",
+                 s_network.panel_a_ip[0], s_network.panel_a_ip[1],
+                 s_network.panel_a_ip[2], s_network.panel_a_ip[3],
+                 (unsigned)s_network.tcp_camerad_port,
+                 s_network.panel_b_ip[0], s_network.panel_b_ip[1],
+                 s_network.panel_b_ip[2], s_network.panel_b_ip[3],
+                 (unsigned)s_network.panel_b_port);
     } else {
         LOG_ERROR("config: network save FAILED");
     }

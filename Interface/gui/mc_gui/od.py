@@ -73,6 +73,18 @@ _UNIT_SUFFIXES = [
     ("_hz", "Hz"), ("_v", "V"), ("_a", "A"), ("_h", "H"),
 ]
 
+# Explicit units for float32 names the suffix heuristic can't catch (accel/jerk knobs etc.).
+_UNIT_BY_NAME = {
+    "max_accel_rad_s2": "rad/s^2",
+    "vel_accel_up": "rad/s^2", "vel_accel_dn": "rad/s^2", "vel_accel_jerk": "rad/s^3",
+    "hb_cur_bandwidth": "rad/s",
+}
+
+# Entries shown as hex (bitfields / CiA error codes), keyed by (index, sub) — NOT whole
+# indices: 0x2600 mixes the fault-flags bitfield (sub 1) with F32 engineering values that
+# must read as decimals (the position limits, trip current, max vel/accel, bus voltage).
+_HEX_KEYS = {(0x6040, 0), (0x6041, 0), (0x603F, 0), (0x1001, 0), (0x2600, 1)}
+
 
 def map_word(index: int, sub: int, bits: int) -> int:
     """MC_IF_TLM_MAP_ENTRY: (index<<16) | (sub<<8) | bitlen."""
@@ -164,8 +176,8 @@ class OdEntry:
         return int(round(si / self.scale))
 
     def format_value(self, raw: int | float) -> str:
-        """Human-readable value string (SI for scaled/float, hex for bitfields)."""
-        if self.index in (0x6040, 0x6041, 0x603F, 0x1001, 0x2600):
+        """Human-readable value string (SI decimal for scaled/float, hex for bitfields)."""
+        if self.key in _HEX_KEYS:
             return f"0x{int(raw):X}"
         if self.is_float or self.scaled:
             return f"{self.raw_to_si(raw):.6g}"
@@ -194,6 +206,8 @@ class OdModel:
 
 
 def _infer_unit(name: str) -> str:
+    if name in _UNIT_BY_NAME:
+        return _UNIT_BY_NAME[name]
     low = name.lower()
     for suffix, unit in _UNIT_SUFFIXES:
         if low.endswith(suffix):
