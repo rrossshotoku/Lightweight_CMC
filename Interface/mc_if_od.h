@@ -125,6 +125,9 @@ typedef enum
 #define MC_IF_STORE_PENDING  (0x0002u)  /* a save is latched, awaiting power-stage-off to commit -- flash
                                          * can't be written while the drive is live; disable it to commit */
 
+/* fault_flags (0x2600/1, RO) bitfield -- manufacturer faults */
+#define MC_IF_FAULT_NO_CONFIG  (0x00000001u)  /* no valid persistent config loaded -> operational drive inhibited (ADR-051) */
+
 /* ===== Test-injection targets (0x2900/2) ===== */
 #define MC_IF_INJECT_NONE          (0u)
 #define MC_IF_INJECT_IQ            (1u)
@@ -237,6 +240,9 @@ typedef enum
     X(0x2300, 6, vel_accel_up,                MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2300, 7, vel_accel_dn,                MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2300, 8, vel_accel_jerk,              MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    /* Holding enable (ADR-054): 1 = hold when stopped (the PI provides whatever current is needed); 0 = */ \
+    /* release the held current ~1 s after the axis settles at zero speed. Boolean -- not a current value. */ \
+    X(0x2300, 9, holding_enable,              MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2310, 1, tlm_vel_demand_rad_s,        MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2310, 2, tlm_vel_actual_rad_s,        MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2310, 3, tlm_vel_iq_cmd_a,            MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
@@ -248,9 +254,8 @@ typedef enum
     X(0x2400, 5, foc_voltage_limit_v,         MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     /* Brushed-DC armature-current PI (ADR-039): set motor R (0x2000:3), L (0x2000:4) + bandwidth (:8); \
        the motor DERIVES the gains kp = wc*L, ki = wc*R and reports them read-only at :6/:7. */ \
-    X(0x2400, 6, hb_cur_kp,                   MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
-    X(0x2400, 7, hb_cur_ki,                   MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
-    X(0x2400, 8, hb_cur_bandwidth,            MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    X(0x2400, 6, hb_cur_kp,                   MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    X(0x2400, 7, hb_cur_ki,                   MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2410, 1, tlm_id_meas_a,               MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2410, 2, tlm_iq_meas_a,               MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2410, 3, tlm_vd_v,                    MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
@@ -267,9 +272,13 @@ typedef enum
     /* Observer output low-pass coefficient (0..1, first-order at the 1 kHz estimator rate; ~57 Hz at 0.3). \
        This filters the velocity the loops use when use_observer=1 -- NOT velocity_filter_hz (ADR-003). */ \
     X(0x2500, 7, est_obs_filter_alpha,        MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    /* Incremental quad encoder scale (ADR-052): signed counts/rev (= 4x lines); the sign sets count direction. */ \
+    X(0x2500, 8, quad_counts_per_rev,         MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2510, 1, tlm_mech_position_rad,       MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2510, 2, tlm_mech_velocity_rad_s,     MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2510, 3, tlm_pos_demand_rad,          MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
+    /* Raw TIM2 quadrature count (4x / TI12), signed around the power-on zero. Diagnostic; ADR-050. */ \
+    X(0x2510, 4, quad_encoder_count,          MC_IF_T_I32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     /* --- 0x2600 faults / limits / diagnostics --- */ \
     X(0x2600, 1, fault_flags,                 MC_IF_T_U32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2600, 2, current_trip_a,              MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
@@ -309,6 +318,8 @@ typedef enum
     X(0x2900, 7, dq_test_angle_rad,           MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     X(0x2900, 8, dq_test_enable,              MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     X(0x2900, 9, dq_test_dwell_ms,            MC_IF_T_U16, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    /* d-axis pulse axis select (ADR-046 ext): 0 = d-axis, 1 = q-axis (FOC SVPWM); 2 = brushed phase (H-bridge). */ \
+    X(0x2900, 10, dq_test_axis,               MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     /* --- 0x2910 loop-tuning test-signal overlay (ADR-030; amplitude/rate units follow test_mode) --- */ \
     X(0x2910, 1, test_mode,                   MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     X(0x2910, 2, test_amplitude,              MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
@@ -349,6 +360,11 @@ typedef enum
     X(0x3011, 0, axis_quick_stop,             MC_IF_T_U8,  MC_IF_A_WO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
     X(0x3012, 0, axis_clear_fault,            MC_IF_T_U8,  MC_IF_A_WO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
     X(0x3013, 0, axis_start_move,             MC_IF_T_U8,  MC_IF_A_WO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
+    /* CMC auto-clears motor faults after they have been active 5 s (defence \
+     * against a transient fault the operator hasn't noticed). Counter is \
+     * RO, U16, since-boot only (not persisted) — increments each time the \
+     * 5 s timer fires whether or not the clear actually succeeds. */ \
+    X(0x3014, 0, axis_auto_fault_clears,      MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
     /* --- 0x3020-0x302F mode + per-mode targets --- */ \
     X(0x3020, 0, axis_op_mode,                MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
     X(0x3021, 0, axis_joystick_value,         MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \

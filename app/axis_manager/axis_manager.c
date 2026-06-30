@@ -781,59 +781,147 @@ static bool proxy_motor_f32_begin(uint32_t slot_idx, float v);
 #define PROXY_SLOT_COUNT           (7u)
 
 /*----------------------------------------------------------------------------
- * TORQUE-mode current jog from on-board UP/DOWN buttons
+ * On-board UP/DOWN buttons — temporary JOYSTICK-mode jog
  *
  * Reads debounced button state from bsp/buttons (GPIO + debounce live there,
- * NOT here — keeps app/ off the HAL). While AXIS_OP_MODE_TORQUE is active we
- * override target_current_a from the (signed) button state; on release we
- * zero it.
+ * NOT here — keeps app/ off the HAL). Pressing a button momentarily forces
+ * the axis into JOYSTICK mode and slams the joystick value to its end stop;
+ * releasing both buttons restores the previous mode AND the physical
+ * stick's reading. This lets the operator jog the axis from the on-board
+ * buttons regardless of whatever mode is currently active (web UI / PC
+ * tool may be in PROFILE_VELOCITY, PROFILE_POSITION, HOLD, etc.).
  *
- * Ownership model: PC-tool writes to 0x302B target_current still take effect
- * when neither button has been pressed. Once a button transitions to held,
- * the buttons take ownership and drive target_current each tick until BOTH
- * are released, at which point we zero target_current (one-shot) and release
- * ownership. The next PC-tool write then passes through normally.
+ * Mapping: UP held -> joystick_value = +1.0 (max), DOWN held -> -1.0 (min),
+ * BOTH held -> 0.0 (operator's hand presumed on both — refuse to pick a
+ * direction). Downstream the JOYSTICK-mode mapping scales by
+ * joystick_max_velocity / velocity_limit just like a real stick deflection.
+ *
+ * Ownership model: while neither button is held, op_mode + joystick_value
+ * are owned by whoever (PC tool, web, physical stick) was driving them.
+ * On the first button press we snapshot op_mode_commanded, switch it to
+ * JOYSTICK, and start writing joystick_value each tick. On release of BOTH
+ * buttons we restore the snapshotted op_mode_commanded and recompute
+ * joystick_value from the current ADC reading once — handing control back
+ * to the physical stick with no zero-glitch.
+ *
+ * Edge cases:
+ * - If the snapshotted mode WAS JOYSTICK, the restore is a no-op
+ *   (op_mode_commanded comparison short-circuits in axis_manager_set_op_mode).
+ * - If someone else (PC tool, web) writes op_mode_commanded WHILE a button
+ *   is held, the next release will restore to the snapshot — clobbering
+ *   that change. This is intentional: the buttons own the mode while held.
+ *
+ * Previously (CHANGELOG <= 4.6.x) these buttons drove target_current_a as
+ * a TORQUE-mode jog. The 0x302C axis_button_current OD entry is now
+ * effectively dead — the field still exists for backwards compatibility
+ * but is no longer read by this handler. Don't repurpose the entry; the
+ * PC tool's CMC Setup page row for it should be removed in a follow-up.
  *---------------------------------------------------------------------------*/
-static bool s_buttons_own_current;   /* true while CMC is driving target_current from buttons */
+/* Post-release hold exit is gated on the motor's own MC_IF_MOVE_MOVING
+ * bit in movement_status (cyclic header, REQ-0013). The motor MCU clears
+ * MOVING when drive is enabled AND |vel demand| AND |vel meas| are both
+ * under ~0.01 rad/s — its own observer is the authoritative judge of
+ * "stopped", and it's far more accurate than anything CMC could derive
+ * from position deltas on this side. No time cap — we wait as long as
+ * the motor takes to decelerate via the JOYSTICK-mode vel_accel_dn ramp.
+ *
+ * (Earlier attempt used s_axis.velocity_actual_rad_s — that field is a
+ * documented TODO at the cyclic-status update site and stays at 0,
+ * which is why the hold previously exited on the first tick.) */
 
-static void poll_torque_buttons(void)
+static bool           s_buttons_own_mode;        /* true while CMC is forcing JOYSTICK mode from buttons */
+static axis_op_mode_t s_buttons_prev_mode;       /* op_mode_commanded snapshot from before button engaged */
+static bool           s_buttons_in_release_hold; /* true between BOTH-buttons-released and motor-stopped */
+
+/* Auto-fault-clear: if the motor sits in AXIS_STATE_FAULT for this long the
+ * CMC fires a clear_fault pulse itself (defence against transient faults the
+ * operator hasn't noticed — overcurrent spike, momentary lost-encoder, etc.).
+ * Counter is exposed read-only via OD 0x3014 axis_auto_fault_clears so the
+ * operator can audit how often this is happening (non-zero after a quiet
+ * session = something's wrong even though the motor looks fine). U16 wraps
+ * after 65535 — at 5 s minimum spacing that's ~91 hours of continuous
+ * faulting before the wrap, so not worth widening. Since-boot only, not
+ * persisted (more useful as "what happened this session" than lifetime). */
+#define AUTO_FAULT_CLEAR_DELAY_MS  5000u
+static uint32_t s_fault_active_since_ms;     /* 0 = not in fault, else time_ms() at entry */
+static uint16_t s_auto_fault_clear_count;
+
+static void poll_joystick_buttons(void)
 {
     bool up_held   = bsp_buttons_up_pressed();
     bool down_held = bsp_buttons_down_pressed();
+    bool any_held  = up_held || down_held;
 
-    /* Outside TORQUE mode the buttons do nothing (and we release ownership
-     * if we held it, restoring write-through for the next mode-switch). */
-    if (s_axis.op_mode_actual != AXIS_OP_MODE_TORQUE) {
-        if (s_buttons_own_current) {
-            s_axis.target_current_a = 0.0f;
-            s_buttons_own_current   = false;
-        }
-        return;
-    }
-
-    bool any_held = up_held || down_held;
     if (any_held) {
-        /* Both held simultaneously -> safety zero (the operator's hand
-         * likely slipped onto both; refuse to pick a direction). */
-        float new_current;
-        if (up_held && down_held)  new_current = 0.0f;
-        else if (up_held)          new_current = +s_axis.button_current_a;
-        else                        new_current = -s_axis.button_current_a;
+        float new_value;
+        if (up_held && down_held)  new_value = 0.0f;     /* safety zero */
+        else if (up_held)          new_value = +1.0f;    /* max joystick */
+        else                       new_value = -1.0f;    /* min joystick */
 
-        if (!s_buttons_own_current) {
-            LOG_INFO("axis_manager: TORQUE button engaged %s -> target_current = %ld mA",
+        /* A re-press during the release-hold (operator changed their mind
+         * before velocity settled) cancels the hold and resumes normal
+         * button ownership of joystick_value. */
+        s_buttons_in_release_hold = false;
+
+        if (!s_buttons_own_mode) {
+            /* First press — snapshot the current commanded mode and force
+             * JOYSTICK so downstream uses joystick_value as the demand.
+             * Route through axis_manager_set_op_mode (NOT a direct field
+             * write) so the validation, edge-detect logging, and "SDO
+             * pending" notice match every other mode change in the system.
+             *
+             * Also auto-enable the axis. The motor is left disabled at
+             * boot (and after panel-timeout deselect) — buttons need to
+             * be usable as a standalone control surface even when no
+             * panel has yet sent SELECT, so press = enable. Matches the
+             * cmc_state SELECT auto-enable pattern. "Fail-on" semantics
+             * apply (we never disable on release; only an explicit
+             * 0x3010 write or panel timeout drops enable). */
+            s_buttons_prev_mode = s_axis.op_mode_commanded;
+            s_buttons_own_mode  = true;
+            LOG_INFO("axis_manager: buttons engaged %s (joystick_value = %+.2f, will restore mode %u on release)",
                      (up_held && down_held) ? "BOTH" : (up_held ? "UP" : "DOWN"),
-                     (long)lroundf(new_current * 1000.0f));
-            s_buttons_own_current = true;
+                     (double)new_value, (unsigned)s_buttons_prev_mode);
+            (void)axis_manager_request_enable(true);
+            (void)axis_manager_set_op_mode((uint8_t)AXIS_OP_MODE_JOYSTICK);
         }
-        s_axis.target_current_a = new_current;
-    } else if (s_buttons_own_current) {
-        /* Released both — zero once and hand control back to OD writes. */
-        LOG_INFO("axis_manager: TORQUE buttons released -> target_current = 0");
-        s_axis.target_current_a = 0.0f;
-        s_buttons_own_current   = false;
+        s_axis.joystick_value = new_value;
+    } else if (s_buttons_own_mode) {
+        /* Both released — enter the release-hold instead of restoring the
+         * mode immediately. Switching out of JOYSTICK while the motor is
+         * still spinning would skip the joystick-mode accel ramp (each
+         * other mode has its own velocity-handling semantics: HOLD pulls
+         * hard to current position, OFF cuts torque, PROFILE_* uses its
+         * own trajectory engine) — that's the audible "sudden stop" the
+         * operator was seeing. By forcing joystick_value = 0 and holding
+         * JOYSTICK mode, the motor decelerates through the configured
+         * vel_accel_dn ramp. We only restore the snapshotted mode once
+         * |velocity_actual| has settled near zero. */
+        if (!s_buttons_in_release_hold) {
+            s_buttons_in_release_hold = true;
+            LOG_INFO("axis_manager: buttons released -> holding JOYSTICK + joystick_value=0, "
+                     "will restore mode %u once motor reports MOVING cleared",
+                     (unsigned)s_buttons_prev_mode);
+        }
+        /* Force zero every tick so a non-centred physical stick can't
+         * keep driving the motor through the hold (operator's hand is
+         * off the stick — buttons are the active control surface). */
+        s_axis.joystick_value = 0.0f;
+
+        if ((s_axis.movement_status & MC_IF_MOVE_MOVING) == 0u) {
+            LOG_INFO("axis_manager: motor stopped (movement_status=0x%04X) -> restoring mode %u, "
+                     "physical stick takes over",
+                     (unsigned)s_axis.movement_status,
+                     (unsigned)s_buttons_prev_mode);
+            (void)axis_manager_set_op_mode((uint8_t)s_buttons_prev_mode);
+            recompute_joystick_value_from_raw();
+            s_buttons_own_mode        = false;
+            s_buttons_in_release_hold = false;
+        }
     }
-    /* else: no button activity and no prior ownership — PC-tool 0x302B writes pass through. */
+    /* else: no button activity and no prior ownership — everything passes
+     * through normally (physical stick drives joystick_value, PC tool /
+     * web drive op_mode_commanded). */
 }
 
 void axis_manager_tick(void)
@@ -868,6 +956,31 @@ void axis_manager_tick(void)
             LOG_INFO("axis_manager: state %s -> %s (statusword=0x%04X err=0x%04X)",
                      axis_state_name(prev_state), axis_state_name(s_axis.state),
                      (unsigned)hdr.statusword, (unsigned)hdr.error_code);
+        }
+
+        /* Auto-fault-clear: track how long the fault has been active and
+         * fire a clear pulse once the dwell exceeds AUTO_FAULT_CLEAR_DELAY_MS.
+         * Re-arms the timer after each attempt so it retries every 5 s while
+         * the fault persists (a stuck fault → counter increments steadily,
+         * giving the operator a visible "this isn't clearing" signal).
+         * Manual clears via 0x3012 work normally — once state != FAULT the
+         * timer resets, so the operator's clear doesn't double-count here. */
+        if (s_axis.state == AXIS_STATE_FAULT) {
+            if (s_fault_active_since_ms == 0u) {
+                /* First tick we observe the fault — start the dwell timer. */
+                s_fault_active_since_ms = time_ms();
+            } else if (time_elapsed_ms(s_fault_active_since_ms) >= AUTO_FAULT_CLEAR_DELAY_MS) {
+                /* Dwell exceeded — pulse FAULT_RESET, bump the count, and
+                 * re-arm for another 5 s in case the fault is sticky. */
+                s_axis.clear_fault_pulse = true;
+                s_auto_fault_clear_count++;
+                s_fault_active_since_ms  = time_ms();
+                LOG_WARN("axis_manager: auto-clearing fault (err=0x%04X, count now %u)",
+                         (unsigned)s_axis.error_code, (unsigned)s_auto_fault_clear_count);
+            }
+        } else if (s_fault_active_since_ms != 0u) {
+            /* Fault cleared (by us, the operator, or naturally) — disarm. */
+            s_fault_active_since_ms = 0u;
         }
         if (prev_op_mode != s_axis.op_mode_actual) {
             LOG_INFO("axis_manager: op_mode_actual %s -> %s (mode_display=%d)",
@@ -910,7 +1023,7 @@ void axis_manager_tick(void)
     /* 3. Sample the on-board UP/DOWN buttons. In TORQUE mode this drives
      * target_current_a; the next step (sequencer) will pick up the new
      * value as a desired-vs-applied diff and queue the 0x6071 SDO write. */
-    poll_torque_buttons();
+    poll_joystick_buttons();
 
     /* 4. Drive the SDO setup-sequencer (one outstanding write at a time). */
     setup_sequencer_tick();
@@ -935,6 +1048,7 @@ bool           axis_manager_is_moving           (void) { return (s_axis.movement
 bool           axis_manager_is_on_target        (void) { return (s_axis.movement_status & MC_IF_MOVE_ON_TARGET) != 0u; }
 uint16_t       axis_manager_get_error_code      (void) { return s_axis.error_code;            }
 uint8_t        axis_manager_get_error_register  (void) { return s_axis.error_register;        }
+uint16_t       axis_manager_get_auto_fault_clears(void){ return s_auto_fault_clear_count;     }
 
 /*----------------------------------------------------------------------------
  * Command latches

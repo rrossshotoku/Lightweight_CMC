@@ -85,6 +85,7 @@ float           axis_manager_get_position_actual    (void);    /* 0x3002 rad */
 float           axis_manager_get_velocity_actual    (void);    /* 0x3003 rad/s */
 uint16_t        axis_manager_get_error_code         (void);    /* 0x3004 */
 uint8_t         axis_manager_get_error_register     (void);    /* 0x3005 */
+uint16_t        axis_manager_get_auto_fault_clears  (void);    /* 0x3014 — since-boot count of auto-cleared faults */
 
 /* --- 0x3010-0x301F commands (write-triggered) --- */
 bool  axis_manager_request_enable           (bool enable);  /* 0x3010 write 1/0 */

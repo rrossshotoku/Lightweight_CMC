@@ -1448,25 +1448,29 @@ class MainWindow(QMainWindow):
             self._cmd_write((0x2900, 5), int(self.mcfg_dac_source.currentData()), "dac_source")
 
     def _dq_run(self) -> None:
-        """Fire the open-loop d-axis voltage pulse (0x2900:6/7/9 + arm :8) for plant ID."""
+        """Fire the open-loop voltage pulse (0x2900:6/7/9/10 + arm :8) — d/q axis or brushed phase."""
         if not self.client.connected:
             QMessageBox.warning(self, "Not connected", "Connect to the CMC first.")
             return
+        axis = int(self.dq_axis.currentData())   # 0 = d-axis, 1 = q-axis, 2 = brushed phase
         if QMessageBox.question(
-                self, "Fire d-axis pulse",
+                self, "Fire open-loop pulse",
                 "This applies an open-loop voltage and energizes the motor, bypassing the CMC.\n\n"
-                "Ensure the axis is mechanically clear and the CMC axis_manager is OFF. Continue?"
+                "q-axis and brushed phase produce torque — the motor can spin. Ensure the axis is "
+                "mechanically clear and the CMC axis_manager is OFF. Continue?"
             ) != QMessageBox.StandardButton.Yes:
             return
-        idx = self.mcfg_dac_source.findData(4)          # ia = id at angle 0 -> show it on PA4
+        dac = 8 if axis == 2 else 4               # brushed -> i_arm ; d/q -> ia
+        idx = self.mcfg_dac_source.findData(dac)
         if idx >= 0:
             self.mcfg_dac_source.setCurrentIndex(idx)   # fires _mcfg_set_dac_source -> writes 0x2900:5
+        self._cmd_write((0x2900, 10), axis, "dq_test_axis")
         self._cmd_write((0x2900, 6), float(self.dq_volts.value()), "dq_test_voltage_v")
         self._cmd_write((0x2900, 7), float(self.dq_angle.value()), "dq_test_angle_rad")
         self._cmd_write((0x2900, 9), int(self.dq_dwell.value()),   "dq_test_dwell_ms")
         self._cmd_write((0x2900, 8), 1, "dq_test_enable")          # arm last -> pulse fires
-        self._log(f"d-axis pulse: {self.dq_volts.value():.2f} V @ {self.dq_angle.value():.3f} rad "
-                  f"for {int(self.dq_dwell.value())} ms — scope PA4 (ia)", "INFO")
+        self._log(f"open-loop pulse [{self.dq_axis.currentText()}]: {self.dq_volts.value():.2f} V "
+                  f"for {int(self.dq_dwell.value())} ms — scope PA4 ({'i_arm' if axis == 2 else 'ia'})", "INFO")
 
     def _dq_stop(self) -> None:
         """Abort the d-axis pulse early (0x2900:8 = 0)."""
@@ -1525,12 +1529,12 @@ class MainWindow(QMainWindow):
 
         lbl = self._bw_labels.get("Current loop gains (0x2400)")
         if lbl is not None:
-            kp, L, wc_b = v.get((0x2400, 3)), v.get((0x2000, 4)), v.get((0x2400, 8))
+            kp, L, hb_kp = v.get((0x2400, 3)), v.get((0x2000, 4)), v.get((0x2400, 6))
             parts = []
             if kp and L and L > 0.0:                    # FOC iq crossover ~ iq_kp/L
                 parts.append(f"FOC iq ≈ {hz(kp / L):.0f} Hz")
-            if wc_b and wc_b > 0.0:                     # brushed: hb_cur_bandwidth is the design wc
-                parts.append(f"brushed wc {hz(wc_b):.0f} Hz")
+            if hb_kp and L and L > 0.0:                 # brushed crossover ~ hb_cur_kp/L
+                parts.append(f"brushed ≈ {hz(hb_kp / L):.0f} Hz")
             if parts:
                 lbl.setText(", ".join(parts))
 
@@ -1593,15 +1597,17 @@ class MainWindow(QMainWindow):
             (0x2300, 1), (0x2300, 2), (0x2300, 3), (0x2300, 4),
             (0x2300, 5),  # vel_load_factor (REQ-0014) — operator load multiplier on kp/ki
             (0x2300, 6), (0x2300, 7), (0x2300, 8),   # velocity-demand accel ramp: caps + ramp-up jerk (ADR-042)
+            (0x2300, 9),   # holding_enable (U8): 1 = hold when stopped, 0 = release held current after settle (ADR-054)
         ]),
         ("Current loop gains (0x2400)", [
             (0x2400, 1), (0x2400, 2), (0x2400, 3), (0x2400, 4), (0x2400, 5),
-            (0x2400, 8),   # brushed current-loop bandwidth wc -> derives kp/ki (ADR-039)
+            (0x2400, 6), (0x2400, 7),   # brushed current PI gains, set directly (ADR-049)
         ]),
         ("State estimator (0x2500)", [
             # 0x2500:1 est_electrical_offset is a calibration RESULT (set by the align routine), not an
             # editable config -- it would be overwritten if set, so it's not an editable row here.
             (0x2500, 2), (0x2500, 3), (0x2500, 4), (0x2500, 5), (0x2500, 6), (0x2500, 7),
+            (0x2500, 8),   # quad_counts_per_rev — incremental quad scale, signed; brushed encoder (ADR-052)
         ]),
         ("Notch filter — current command (0x2930)", [
             (0x2930, 1), (0x2930, 2), (0x2930, 3),   # enable (1/0) / centre Hz / bandwidth Hz (ADR-048)
@@ -1619,6 +1625,18 @@ class MainWindow(QMainWindow):
             (0x2700, 3), (0x2700, 4),
         ]),
     ]
+
+    # Backend relevance for the gray-out (ADR-055): entries used by only ONE backend. Anything not listed
+    # is shared and stays editable. Conservative -- only clearly backend-specific entries are grayed.
+    _MOTORCFG_FOC_ONLY = {
+        (0x2000, 5),                                                      # pole_pairs (electrical commutation)
+        (0x2400, 1), (0x2400, 2), (0x2400, 3), (0x2400, 4), (0x2400, 5),  # FOC id/iq PI gains + voltage limit
+        (0x2700, 3), (0x2700, 4),                                         # electrical-alignment (no commutation on brushed)
+    }
+    _MOTORCFG_BRUSHED_ONLY = {
+        (0x2400, 6), (0x2400, 7),                                         # brushed armature PI gains
+        (0x2500, 8),                                                      # quad_counts_per_rev (quad = brushed encoder today)
+    }
 
     def _build_motorcfg_panel(self) -> QWidget:
         # key -> row-widget dict, for the read/write plumbing (see _cfg_row).
@@ -1683,8 +1701,16 @@ class MainWindow(QMainWindow):
 
         # Plant ID -- open-loop d-axis voltage pulse (ADR-046). Fires Vd for a dwell, then auto-returns to
         # 0. Energizes the motor open-loop (bypasses the CMC); scope the response on PA4.
-        pg = QGroupBox("Plant ID — d-axis voltage pulse (open-loop)")
+        pg = QGroupBox("Open-loop voltage pulse  (plant ID / drive test)")
         pgl = QFormLayout(pg)
+        self.dq_axis = QComboBox()
+        self.dq_axis.addItem("d-axis (FOC, holds — R/L ID)", 0)
+        self.dq_axis.addItem("q-axis (FOC, torque axis)", 1)
+        self.dq_axis.addItem("brushed phase (H-bridge armature)", 2)
+        self.dq_axis.setToolTip("d/q-axis: open-loop SVPWM at the angle below (FOC/BLDC backend). "
+                                "brushed phase: open-loop armature voltage on the H-bridge (brushed backend). "
+                                "Pick the one matching the configured backend; the other is a no-op.")
+        pgl.addRow("axis:", self.dq_axis)
         self.dq_volts = QDoubleSpinBox()
         self.dq_volts.setRange(0.0, 12.0); self.dq_volts.setSingleStep(0.5)
         self.dq_volts.setDecimals(2); self.dq_volts.setValue(1.5); self.dq_volts.setSuffix(" V")
@@ -1758,6 +1784,7 @@ class MainWindow(QMainWindow):
                     continue
                 row_widgets = self._make_setup_row(entry)
                 grid.addRow(self._setup_row_label(entry), row_widgets["container"])
+                row_widgets["label"] = grid.labelForField(row_widgets["container"])  # QLabel, for the gray-out tooltip (ADR-055)
                 self._mcfg_rows[key] = row_widgets
                 self._mcfg_keys.append(key)
             if group_title in ("Position loop gains (0x2200)", "Velocity loop gains (0x2300)",
@@ -1783,6 +1810,8 @@ class MainWindow(QMainWindow):
                 grid.addRow("Damping ζ:", zw)
             col.addWidget(box)
 
+        self.mcfg_backend.currentIndexChanged.connect(self._apply_backend_relevance)
+        self._apply_backend_relevance()   # initial gray-out for the default/selected backend (ADR-055)
         col.addWidget(self._build_motorcfg_actions())
         col.addWidget(self._build_inertia_estimator())
         col.addStretch(1)
@@ -2473,6 +2502,23 @@ class MainWindow(QMainWindow):
             f"Wrote motor_backend_sel = {sel} ({name}).\n\n"
             "Now click 'Save to flash', then power-cycle the controller — the backend and the "
             "current-sense ADC channel are applied at boot.")
+
+    def _apply_backend_relevance(self, *_args) -> None:
+        """Gray out motor-config value fields not used by the selected backend (combo, 0x2000:6).
+        GUI-only, conservative; shared rows stay editable. The label stays enabled so its tooltip can
+        explain why (a disabled widget won't show one). (ADR-055)"""
+        be = int(self.mcfg_backend.currentData() or 0)   # 0 = FOC/BLDC, 1 = brushed
+        for key, row in getattr(self, "_mcfg_rows", {}).items():
+            if be == 1 and key in self._MOTORCFG_FOC_ONLY:
+                relevant, why = False, "Not used by the brushed-DC backend."
+            elif be == 0 and key in self._MOTORCFG_BRUSHED_ONLY:
+                relevant, why = False, "Not used by the BLDC / FOC backend."
+            else:
+                relevant, why = True, ""
+            row["container"].setEnabled(relevant)
+            lbl = row.get("label")
+            if lbl is not None:
+                lbl.setToolTip(why)
 
     def _mcfg_read_all(self) -> None:
         if not self.client.connected:

@@ -106,6 +106,7 @@ MC_IfOdResult_t cmc_od_read(uint16_t idx, uint8_t sub,
     case 0x3012:                /* clear_fault is WO */
     case 0x3013:                /* start_move  is WO */
         return MC_IF_OD_ERR_ACCESS;
+    case 0x3014: READ_U16(axis_manager_get_auto_fault_clears());
 
     /* --- 0x3020-0x302F mode + targets --- */
     case 0x3020: READ_U8 (axis_manager_get_op_mode());
@@ -301,6 +302,10 @@ static MC_IfOdResult_t cmc_od_write_inner(uint16_t idx, uint8_t sub,
         if (in_type != MC_IF_T_U8) return MC_IF_OD_ERR_TYPE;
         if (get_u8(in_data) != 1)  return MC_IF_OD_ERR_RANGE;
         WRITE_OK_OR(axis_manager_request_start_move());
+
+    /* --- 0x3014 axis_auto_fault_clears (U16 RO) — diagnostic counter --- */
+    case 0x3014:
+        return MC_IF_OD_ERR_ACCESS;
 
     /* --- 0x3020 axis_op_mode (U8 RW) --- */
     case 0x3020:

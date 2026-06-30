@@ -222,11 +222,11 @@ def test_gui_build(model):
     assert hasattr(win, "mcfg_backend") and win.mcfg_backend.count() == 2
     assert hasattr(win, "mcfg_backend_lbl")   # reads back motor_backend_sel (0x2000:6) on connect
     assert model.get(0x2000, 6) is not None and model.get(0x2000, 6).name == "motor_backend_sel"
-    # Brushed current loop: bandwidth (0x2400:8) is the editable input; kp/ki (0x2400:6/7) are
-    # DERIVED + read-only (no longer editable rows); measured current is telemetry (0x2410:6).
-    assert (0x2400, 8) in win._mcfg_rows and model.get(0x2400, 8).name == "hb_cur_bandwidth"
-    assert (0x2400, 6) not in win._mcfg_rows and (0x2400, 7) not in win._mcfg_rows
-    assert model.get(0x2400, 6).name == "hb_cur_kp" and model.get(0x2400, 7).name == "hb_cur_ki"
+    # Brushed current loop: kp/ki (0x2400:6/7) are directly editable rows (ADR-049, RW PERSIST);
+    # the bandwidth (0x2400:8) was removed; measured current is telemetry (0x2410:6).
+    assert (0x2400, 6) in win._mcfg_rows and model.get(0x2400, 6).name == "hb_cur_kp"
+    assert (0x2400, 7) in win._mcfg_rows and model.get(0x2400, 7).name == "hb_cur_ki"
+    assert (0x2400, 8) not in win._mcfg_rows   # bandwidth removed (no longer an editable row)
     assert model.get(0x2410, 6) is not None and model.get(0x2410, 6).name == "tlm_i_arm_a"
     assert hasattr(win, "mcfg_cur_lbl") and hasattr(win, "mcfg_kp_lbl") and hasattr(win, "mcfg_ki_lbl")
     # Motor safety envelope (ADR-040): motor-owned, enforced velocity/accel ceilings as config rows.
