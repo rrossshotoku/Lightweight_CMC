@@ -116,6 +116,14 @@ typedef enum
 #define MC_IF_CAL_DONE_MECH_ZERO       (0x0002u)  /* mechanical home set (0x2700/1=3)                          */
 #define MC_IF_CAL_DONE_CURRENT_OFFSET  (0x0004u)  /* phase-current ADC offsets measured (0x2700/1=2)           */
 
+/* ===== Homing / zeroing (0x2700/9 home_status, RO) ===== (ADR-057)
+ * PC-triggered drive-to-hard-stop for incremental encoders: drive at home_velocity until the armature
+ * current exceeds home_current for ~300 ms (the stall), then set the encoder zero at that position. */
+#define MC_IF_HOME_IDLE     (0u)
+#define MC_IF_HOME_RUNNING  (1u)
+#define MC_IF_HOME_DONE     (2u)
+#define MC_IF_HOME_FAILED   (3u)
+
 /* ===== Persistence (0x2800) ===== */
 #define MC_IF_SAVE_MAGIC           (0x7376u)  /* write to 0x2800/1 to request a save */
 #define MC_IF_FACTORY_RESET_MAGIC  (0x7274u)  /* write to 0x2800/3 to request factory reset */
@@ -127,6 +135,8 @@ typedef enum
 
 /* fault_flags (0x2600/1, RO) bitfield -- manufacturer faults */
 #define MC_IF_FAULT_NO_CONFIG  (0x00000001u)  /* no valid persistent config loaded -> operational drive inhibited (ADR-051) */
+#define MC_IF_FAULT_NOT_HOMED  (0x00000002u)  /* incremental encoder not yet zeroed -> position recalls blocked; re-home each power-up (ADR-057) */
+#define MC_IF_FAULT_OVERCURRENT (0x00000004u)  /* over-current trip active (the OC trip); latched into fault_flags_latched too (ADR-058) */
 
 /* ===== Test-injection targets (0x2900/2) ===== */
 #define MC_IF_INJECT_NONE          (0u)
@@ -295,12 +305,21 @@ typedef enum
        traj_use_scurve = 1 selects the S-curve planner for PROFILE_POSITION moves, 0 = trapezoidal (default). */ \
     X(0x2600, 8, max_jerk_rad_s3,             MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2600, 9, traj_use_scurve,             MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    /* Sticky OR of every fault_flags bit set since boot -- fault history (faults triggered previously + cleared). Not persisted. (ADR-058) */ \
+    X(0x2600, 10, fault_flags_latched,        MC_IF_T_U32, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     /* --- 0x2700 calibration --- */ \
     X(0x2700, 1, cal_command,                 MC_IF_T_U16, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     X(0x2700, 2, cal_status,                  MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     X(0x2700, 3, cal_align_current_a,         MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2700, 4, cal_align_hold_ms,           MC_IF_T_U16, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2700, 5, cal_done_flags,              MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    /* Homing to a hard end stop for incremental encoders (ADR-057): drive at home_velocity (signed) until */ \
+    /* the armature current exceeds home_current for ~300 ms (the stall), then set the encoder zero there.  */ \
+    /* home_command: 1 = run, 0 = idle/abort (also clears done/failed). home_status: MC_IF_HOME_*.          */ \
+    X(0x2700, 6, home_velocity_rad_s,         MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    X(0x2700, 7, home_current_a,              MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    X(0x2700, 8, home_command,                MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    X(0x2700, 9, home_status,                 MC_IF_T_U8,  MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     /* --- 0x2800 persistent store --- */ \
     X(0x2800, 1, store_save_command,          MC_IF_T_U16, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     X(0x2800, 2, store_status,                MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
@@ -368,7 +387,11 @@ typedef enum
     /* --- 0x3020-0x302F mode + per-mode targets --- */ \
     X(0x3020, 0, axis_op_mode,                MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
     X(0x3021, 0, axis_joystick_value,         MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
-    X(0x3022, 0, axis_joystick_max_velocity,  MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_CMC) \
+    /* 0x3022 was RW-PERSIST through 4.7.x. As of 4.8.0 it is DERIVED from \
+     * velocity_limit (0x3030) x joy_profile_scale (CAMERAD JOY_PROFILE_*): \
+     * no longer independently settable, no longer separately persisted. \
+     * Writes return ACCESS-denied; reads report the current derived value. */ \
+    X(0x3022, 0, axis_joystick_max_velocity,  MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
     X(0x3023, 0, axis_target_velocity,        MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
     X(0x3024, 0, axis_target_position,        MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
     X(0x3025, 0, axis_target_time,            MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
@@ -394,12 +417,20 @@ typedef enum
     X(0x3031, 0, axis_position_limit_lo,      MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_CMC) \
     X(0x3032, 0, axis_position_limit_hi,      MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_CMC) \
     X(0x3033, 0, axis_accel_limit,            MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_CMC) \
-    /* --- 0x3040-0x304F dynamics / payload reserved (kept free for any     */ \
-    /* future CMC-side dynamics state that doesn't belong on the motor).    */ \
-    /* The earlier CMC-only axis_payload_weight_kg (0x3040) was REMOVED     */ \
-    /* in CHANGELOG [4.1.0] — the operator-tunable load multiplier moved    */ \
-    /* to motor-owned 0x2300:5 vel_load_factor (REQ-0014) so it actually    */ \
-    /* scales the velocity loop's kp/ki at runtime.                          */ \
+    /* --- 0x3040-0x304F home-to-endstop control surface ---                */ \
+    /* CMC-owned mirror of the motor's home sequence (motor's own entries   */ \
+    /* live at 0x2700:6/7/8/9). axis_manager runs the sequencer: SDO writes */ \
+    /* motor 0x2700:8=1, polls motor 0x2700:9 for DONE / FAILED, then       */ \
+    /* re-reads motor 0x2600:1 fault_flags to update is_homed. cmc_state    */ \
+    /* gates shot recalls on is_homed. Adds nothing to the wire — just      */ \
+    /* re-exposes the motor state through the CMC axis so the PC tool /     */ \
+    /* web UI can drive the whole procedure via a single command surface.   */ \
+    /* home_command: WO, write 1 to start (0 = abort/idle also forwarded).  */ \
+    /* home_status:  RO, reflects the motor's MC_IF_HOME_* enum.            */ \
+    /* is_homed:     RO, 1 if motor fault_flags does NOT have NOT_HOMED.    */ \
+    X(0x3040, 0, axis_home_command,           MC_IF_T_U8,  MC_IF_A_WO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
+    X(0x3041, 0, axis_home_status,            MC_IF_T_U8,  MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
+    X(0x3042, 0, axis_is_homed,               MC_IF_T_U8,  MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
     /* --- 0x3050-0x305F CMC persistence triggers --- */ \
     /* Write MC_IF_SAVE_MAGIC (0x7376) to commit the corresponding region   */ \
     /* to the CMC's internal flash. Same magic constant used by the motor   */ \

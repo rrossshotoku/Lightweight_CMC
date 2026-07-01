@@ -154,10 +154,11 @@ MC_IfOdResult_t cmc_od_read(uint16_t idx, uint8_t sub,
     case 0x3032: READ_F32(axis_manager_get_position_limit_hi());
     case 0x3033: READ_F32(axis_manager_get_accel_limit());
 
-    /* --- 0x3040-0x304F dynamics / payload — currently empty.
-     * (0x3040 axis_payload_weight_kg removed in CHANGELOG [4.1.0] —
-     * see REQ-0014; the load-factor concept is now motor-owned at
-     * 0x2300:5 vel_load_factor.) --- */
+    /* --- 0x3040-0x304F home-to-endstop control surface --- */
+    case 0x3040:                                                        /* WO */
+        return MC_IF_OD_ERR_ACCESS;
+    case 0x3041: READ_U8(axis_manager_get_home_status());
+    case 0x3042: READ_U8(axis_manager_is_homed() ? 1u : 0u);
 
     /* --- 0x3050-0x305F persistence triggers (WO) --- */
     case 0x3050:                /* cmc_save_config */
@@ -318,10 +319,10 @@ static MC_IfOdResult_t cmc_od_write_inner(uint16_t idx, uint8_t sub,
         sz = check_write_size(MC_IF_T_F32, in_len); if (sz != MC_IF_OD_OK) return sz;
         if (in_type != MC_IF_T_F32) return MC_IF_OD_ERR_TYPE;
         WRITE_OK_OR(axis_manager_set_joystick_value(get_f32(in_data)));
+    /* 0x3022 axis_joystick_max_velocity — RO since 4.8.0. Derived from
+     * velocity_limit × joy_profile_scale; not directly writable. */
     case 0x3022:
-        sz = check_write_size(MC_IF_T_F32, in_len); if (sz != MC_IF_OD_OK) return sz;
-        if (in_type != MC_IF_T_F32) return MC_IF_OD_ERR_TYPE;
-        WRITE_OK_OR(axis_manager_set_joystick_max_velocity(get_f32(in_data)));
+        return MC_IF_OD_ERR_ACCESS;
     case 0x3023:
         sz = check_write_size(MC_IF_T_F32, in_len); if (sz != MC_IF_OD_OK) return sz;
         if (in_type != MC_IF_T_F32) return MC_IF_OD_ERR_TYPE;
@@ -385,9 +386,18 @@ static MC_IfOdResult_t cmc_od_write_inner(uint16_t idx, uint8_t sub,
         if (in_type != MC_IF_T_F32) return MC_IF_OD_ERR_TYPE;
         WRITE_OK_OR(axis_manager_set_accel_limit(get_f32(in_data)));
 
-    /* (0x3040 axis_payload_weight_kg removed in CHANGELOG [4.1.0] — see
-     * REQ-0014. Operator-tunable load is now motor-owned at 0x2300:5
-     * vel_load_factor; CMC web slider writes there directly via SDO.) */
+    /* --- 0x3040 axis_home_command — U8, write 1 to start homing.
+     * 0 (idle/abort) currently no-op on CMC; the motor's own home_command
+     * would need it for abort, but that path isn't required here. */
+    case 0x3040:
+        sz = check_write_size(MC_IF_T_U8, in_len); if (sz != MC_IF_OD_OK) return sz;
+        if (in_type != MC_IF_T_U8) return MC_IF_OD_ERR_TYPE;
+        if (get_u8(in_data) != 1u) return MC_IF_OD_ERR_RANGE;
+        WRITE_OK_OR(axis_manager_request_home());
+    /* 0x3041 axis_home_status + 0x3042 axis_is_homed are RO. */
+    case 0x3041:
+    case 0x3042:
+        return MC_IF_OD_ERR_ACCESS;
 
     /* --- 0x3050 cmc_save_config: write MC_IF_SAVE_MAGIC to commit ---
      * Two-side save: CMC's own persist (axis_persist blob — joystick cal,

@@ -348,13 +348,12 @@ static void build_config_json(void)
      * 24 bytes is enough for any finite F32 (worst case ~16 digits + sign
      * + decimal + NUL). */
     char b_vel[24], b_plo[24], b_phi[24], b_acc[24];
-    char b_jmax[24], b_load[24];
+    char b_load[24];
     char b_aup[24], b_adn[24], b_ajk[24];
     const char *s_vel  = fmt_f32(axis_manager_get_velocity_limit(),      b_vel,  sizeof(b_vel));
     const char *s_plo  = fmt_f32(axis_manager_get_position_limit_lo(),   b_plo,  sizeof(b_plo));
     const char *s_phi  = fmt_f32(axis_manager_get_position_limit_hi(),   b_phi,  sizeof(b_phi));
     const char *s_acc  = fmt_f32(axis_manager_get_accel_limit(),         b_acc,  sizeof(b_acc));
-    const char *s_jmax = fmt_f32(axis_manager_get_joystick_max_velocity(),b_jmax,sizeof(b_jmax));
     const char *s_load = fmt_f32(axis_manager_get_load_factor(),         b_load, sizeof(b_load));
     const char *s_aup  = fmt_f32(axis_manager_get_vel_accel_up(),        b_aup,  sizeof(b_aup));
     const char *s_adn  = fmt_f32(axis_manager_get_vel_accel_dn(),        b_adn,  sizeof(b_adn));
@@ -384,7 +383,6 @@ static void build_config_json(void)
             "\"accel\":%s"
           "},"
           "\"joystick\":{"
-            "\"max_velocity\":%s,"
             "\"raw_center\":%ld,"
             "\"raw_full_pos\":%ld,"
             "\"raw_full_neg\":%ld,"
@@ -410,7 +408,6 @@ static void build_config_json(void)
         (unsigned)net->panel_b_port,
         net->panel_b_ip[0], net->panel_b_ip[1], net->panel_b_ip[2], net->panel_b_ip[3],
         s_vel, s_plo, s_phi, s_acc,
-        s_jmax,
         (long)axis_manager_get_joystick_raw_center(),
         (long)axis_manager_get_joystick_raw_full_pos(),
         (long)axis_manager_get_joystick_raw_full_neg(),
@@ -501,7 +498,6 @@ static void apply_config_json(const char *json)
     const char *js = find_key(json, "joystick");
     if (js && *js == '{') {
         const char *p; float f; int32_t i; uint32_t u;
-        if ((p = find_key(js, "max_velocity"))  && parse_f32(p, &f)) (void)axis_manager_set_joystick_max_velocity(f);
         if ((p = find_key(js, "raw_center"))    && parse_i32(p, &i)) (void)axis_manager_set_joystick_raw_center(i);
         if ((p = find_key(js, "raw_full_pos")) && parse_i32(p, &i)) (void)axis_manager_set_joystick_raw_full_pos(i);
         if ((p = find_key(js, "raw_full_neg")) && parse_i32(p, &i)) (void)axis_manager_set_joystick_raw_full_neg(i);

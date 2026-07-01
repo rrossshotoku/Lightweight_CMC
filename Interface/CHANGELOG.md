@@ -23,6 +23,43 @@ This is the **authoritative change history** for the shared inter-MCU boundary c
 
 ---
 
+## [4.9.0] - 2026-07-01  (wire-breaking? no — additive: CMC-side home-to-endstop orchestration + shot-recall gate)
+
+CMC-owned surface added on top of the motor's existing homing entries (0x2700:8/9 + `NOT_HOMED` bit in `0x2600:1` fault_flags — motor MCU unchanged). `axis_manager` runs the sequence: SDO-writes motor 0x2700:8=1, polls motor 0x2700:9 every 200 ms for `MC_IF_HOME_DONE` / `FAILED`, then re-reads motor `fault_flags` to refresh the local `is_homed` cache. Shot recalls in `cmc_state_move_to_shot` are now GATED on `is_homed`: a stored position on an un-homed incremental encoder is meaningless, so recalls are rejected with a warning until the operator has run the procedure once. Fresh `fault_flags` is also read once at first tick after boot so the gate has a real answer before the first move attempt.
+
+### Added (OD entries)
+- **`0x3040 axis_home_command`** (U8 WO, `MC_IF_OWNER_CMC`): write 1 to start the home sequence via axis_manager. Not persisted.
+- **`0x3041 axis_home_status`** (U8 RO, `MC_IF_OWNER_CMC`): mirrors the motor's `MC_IF_HOME_*` (IDLE/RUNNING/DONE/FAILED). Sticky between runs.
+- **`0x3042 axis_is_homed`** (U8 RO, `MC_IF_OWNER_CMC`): 1 if motor `fault_flags & NOT_HOMED == 0` AND we've successfully read fault_flags at least once. `cmc_state_move_to_shot` reads this before every recall.
+
+### Consumers to update
+- **motor-control MCU**: nothing — the motor's own home entries (0x2700:6/7/8/9) and the `NOT_HOMED` fault bit already exist and are unchanged.
+- **network MCU** (this project): implemented — `axis_manager` runs the sequencer (`tick_home_sequencer`) via the cia402 OD pipeline, exposes `axis_manager_request_home` / `axis_manager_get_home_status` / `axis_manager_is_homed`; `cmc_od` dispatches 0x3040/1/2; `cmc_state_move_to_shot` rejects when `!is_homed`.
+- **PC tool**: no code change required — the new entries auto-appear in the OD browser via the X-macro parser. A future PC-tool UX pass may want a dedicated "Home axis" button that writes 0x3040:0 = 1 and watches 0x3041:0.
+
+---
+
+## [4.8.0] - 2026-07-01  (wire-breaking? no — access-tightening on existing CMC entry + CAMERAD JOY_PROFILE wiring)
+
+CMC-side re-plumbing of joystick full-scale velocity. `axis_joystick_max_velocity` (0x3022) is no longer operator-settable and no longer independently persisted — it is DERIVED from `axis_velocity_limit` (0x3030) × the currently-selected joystick speed profile. CAMERAD `JOY_PROFILE_NORMAL/MEDIUM/FINE` keypresses (previously ack-only stubs) now scale the profile:
+
+- `NORMAL` → 1.00 × velocity_limit (full stick reaches the motion ceiling)
+- `MEDIUM` → 0.50 × velocity_limit
+- `FINE`   → 0.15 × velocity_limit
+
+### Changed (access)
+- `0x3022 axis_joystick_max_velocity`: **MC_IF_A_RW → MC_IF_A_RO** and PERSIST flag dropped. Writes return `MC_IF_OD_ERR_ACCESS`. Reads still work (report the current derived rad/s). Boot default: velocity_limit × 1.0 (profile = NORMAL, not persisted).
+
+### Migration
+- The persist blob layout is UNCHANGED (v4). The `joystick_max_velocity` slot in the blob is now IGNORED on load and populated with the current derived value on save. So operators keep their calibration, motion limits, and LED colour across the upgrade — only the standalone max-velocity slider goes away. Rolling back to 4.7.x reads the stale derived value from the slot; no data loss either direction.
+
+### Consumers to update
+- **motor-control MCU**: nothing — CMC-owned entry.
+- **network MCU** (this project): implemented. `axis_manager` derives via `recompute_joystick_max_velocity()`; `controller_mgr` routes `JOY_PROFILE_*` keypresses; `cmc_od` rejects writes to 0x3022; web page + `/api/config` drop the `max_velocity` field; new public API `axis_manager_set_joy_profile(uint8_t)`.
+- **PC tool**: the 0x3022 row is removed from the CMC Setup page. OD browser still lists it (now as RO).
+
+---
+
 ## [4.7.0] - 2026-06-30  (wire-breaking? no — additive: CMC-owned auto-fault-clear diagnostic counter)
 
 CMC-only addition. `axis_auto_fault_clears` (0x3014, U16, RO, MC_IF_OWNER_CMC) — since-boot count of motor faults the CMC auto-cleared. The CMC now watches `AXIS_STATE_FAULT`; if it persists for ≥ 5 s the CMC fires `clear_fault_pulse` itself and increments the counter. Re-arms every 5 s while the fault remains, so a non-clearable fault shows up as a steadily increasing counter. Not persisted (since-boot diagnostic). No motor MCU change, no `MC_IF_PROTOCOL_VERSION` bump. Read via SDO 0x3014:0 or in the PC tool / web UI like any other RO entry.
@@ -67,6 +104,8 @@ Motor-owned additions for the brushed-DC backend (ADR-039) and current-loop tuni
 - **`0x2600:1 fault_flags` bit 0 = `MC_IF_FAULT_NO_CONFIG`** (new bit semantic, ADR-051): set when no valid persistent config is loaded at boot; the motor's **operational drive is inhibited** until a valid config loads or is saved (commissioning/align still work). Bit definition on the existing entry (not a new entry) → no `MC_IF_PROTOCOL_VERSION` bump; CMC unaffected. **Consumers (PC tool): may decode the bit for display.**
 - **`0x2500:8 quad_counts_per_rev`** (F32, RW, PERSIST, motor-owned): incremental quad-encoder scale (signed = 4× lines; the sign sets count direction) for the brushed axis. Feeds the quad count through the shared state estimator → **closes the brushed velocity loop** (ADR-052). Additive; CMC unaffected. Velocity-loop gains (`0x2300`) reused unchanged.
 - **`0x2300:9 holding_enable`** (U8, RW, PERSIST, motor-owned): **boolean — not a current** (the PI provides whatever current is needed; this just toggles holding on/off). `0` = release the held current ~1 s after the axis settles at zero velocity (velocity mode; parks the integrator, bumpless resume; stays released until a non-zero command); `1` (default) = always hold. For self-locking actuators that don't need holding current (ADR-054; **revised from F32 `holding_current_a`** — re-sync the PC tool, type+name changed). Additive; CMC unaffected.
+- **`0x2700:6/7/8/9 home_velocity_rad_s / home_current_a / home_command / home_status`** (F32/F32/U8/U8; :6/:7 RW PERSIST, :8 RW, :9 RO, motor-owned): **PC-triggered hard-stop homing** for incremental encoders (ADR-057). `home_command = 1` drives velocity mode at `home_velocity` (signed) until `|armature current| > home_current` for ~10 ms **or the OC trip fires** (the stall against the end stop — a hard stop trips the OC before a long dwell would confirm; an OC hit is consumed/cleared), then sets the encoder zero there and stops (`home_status` → `MC_IF_HOME_DONE`); 30 s safety timeout → `MC_IF_HOME_FAILED`; `home_command = 0` aborts / clears. Absolute position + soft limits become usable on an incremental axis once homed. **Until homed, position recalls are blocked** and `0x2600:1 fault_flags` bit **`MC_IF_FAULT_NOT_HOMED`** is set — the CMC must home the axis before commanding a recall. The homed state is **not persisted** (re-home every power-up); an absolute encoder (SSI) never sets the bit. Motor-level commissioning (bypasses the CMC while running, like the dq-test); the CMC forwards the entries like any motor entry.
+- **`0x2600:10 fault_flags_latched`** (U32, RO, motor-owned) + new **`MC_IF_FAULT_OVERCURRENT`** `fault_flags` bit: motor **fault register + since-boot history** for the new PC-tool Diagnostics panel (ADR-058). The OC trip is now a `fault_flags` bit (so `fault_flags` is the complete motor fault register), and `fault_flags_latched` is the sticky OR of every fault bit set since boot — faults that fired and were then cleared still show. Not persisted (resets each power-up). Additive; the CMC forwards like any motor entry. **PC tool: new "Diagnostics (faults & state)" group (motor + CMC operating state, active faults, fault history, CMC auto-cleared-fault count).**
 - **`0x2300:6/7/8 vel_accel_up / vel_accel_dn / vel_accel_jerk`** (F32, RW, PERSIST, motor-owned): velocity-demand **acceleration ramp** (ADR-042) — slews the PROFILE_VELOCITY (joystick) demand toward the setpoint under an acceleration cap (`accel_up` while speeding up, `accel_dn` while slowing down [rad/s²]; `0` = that phase off). `accel_jerk` [rad/s³] eases the acceleration *up* to the cap; it falls *freely* on the way down, so it lands on the setpoint with no overshoot. `accel_jerk = 0` (default) = step to the cap = plain accel ramp. The position cascade + tuning generator bypass it. **Consumer (CMC):** these are operator-facing joystick-feel params — surface them in the CMC's joystick config UI as proxied writes to the motor, alongside the `axis_manager` calibration (`0x3022`, `0x3027–0x302A`). They persist on the **motor** (motor save-to-flash) while that calibration persists on the **CMC**, so an operator "save joystick setup" spans both save domains.
 
 ### Changed (access)

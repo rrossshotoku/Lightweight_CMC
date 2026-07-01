@@ -87,6 +87,14 @@ uint16_t        axis_manager_get_error_code         (void);    /* 0x3004 */
 uint8_t         axis_manager_get_error_register     (void);    /* 0x3005 */
 uint16_t        axis_manager_get_auto_fault_clears  (void);    /* 0x3014 — since-boot count of auto-cleared faults */
 
+/* --- Home-to-endstop (0x3040 command, 0x3041 status, 0x3042 is_homed) ---
+ * axis_manager runs the sequence against the motor's own homing entries
+ * (0x2700:8/9 + fault_flags at 0x2600:1). Shot recalls in cmc_state are
+ * gated on axis_manager_is_homed(). */
+bool     axis_manager_request_home              (void);        /* 0x3040 write 1 */
+uint8_t  axis_manager_get_home_status           (void);        /* 0x3041 — MC_IF_HOME_* mirror */
+bool     axis_manager_is_homed                  (void);        /* 0x3042 — fault_flags & NOT_HOMED == 0 */
+
 /* --- 0x3010-0x301F commands (write-triggered) --- */
 bool  axis_manager_request_enable           (bool enable);  /* 0x3010 write 1/0 */
 bool  axis_manager_request_quick_stop       (void);         /* 0x3011 write 1 — hard decel + disable */
@@ -107,8 +115,12 @@ bool            axis_manager_set_op_mode             (uint8_t v);    /* 0x3020 *
 float  axis_manager_get_joystick_value               (void);
 bool   axis_manager_set_joystick_value               (float v);      /* 0x3021 */
 
-float  axis_manager_get_joystick_max_velocity        (void);
-bool   axis_manager_set_joystick_max_velocity        (float v);      /* 0x3022 */
+/* 0x3022 joystick_max_velocity is RO — derived from
+ * velocity_limit × joy_profile_scale. CAMERAD JOY_PROFILE_* keypresses
+ * flip the profile via axis_manager_set_joy_profile below. */
+float   axis_manager_get_joystick_max_velocity       (void);          /* 0x3022 (RO) */
+uint8_t axis_manager_get_joy_profile                 (void);
+bool    axis_manager_set_joy_profile                 (uint8_t p);     /* 0 NORMAL, 1 MEDIUM, 2 FINE */
 
 float  axis_manager_get_target_velocity              (void);
 bool   axis_manager_set_target_velocity              (float v);      /* 0x3023 */

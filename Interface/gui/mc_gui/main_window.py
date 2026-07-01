@@ -87,9 +87,21 @@ _CMD_STATE_KEYS = [(0x3000, 0), (0x6041, 0), (0x6064, 0), (0x606C, 0), (0x6077, 
                    (0x2920, 8), (0x2920, 9)]  # + freq-sweep current freq / active (ADR-047)
 # Motor Config tab live readouts, also handled by _cmd_on_state_read (measured current, derived
 # brushed gains, configured backend). Routed to that handler but NOT command-state polled.
-_MCFG_READOUT_KEYS = [(0x2000, 6), (0x2410, 6), (0x2400, 6), (0x2400, 7), (0x3001, 0)]
+_MCFG_READOUT_KEYS = [(0x2000, 6), (0x2410, 6), (0x2400, 6), (0x2400, 7), (0x3001, 0), (0x2700, 9)]
 # Motor Command tab on-demand readouts (the accel-ramp "Read" button), routed to _cmd_on_state_read.
 _CMD_READOUT_KEYS = [(0x2300, 6), (0x2300, 7), (0x2300, 8)]   # accel ramp up / dn / jerk
+# Diagnostics group live readouts (faults + state, motor + CMC), routed to _cmd_on_state_read. (ADR-058)
+_DIAG_KEYS = [(0x2600, 1), (0x2600, 10), (0x6041, 0), (0x3000, 0), (0x3004, 0), (0x3005, 0), (0x3014, 0)]
+_MOTOR_FAULT_BITS = [(0x1, "NO_CONFIG"), (0x2, "NOT_HOMED"), (0x4, "OVERCURRENT")]
+
+def _decode_motor_faults(v: int) -> str:
+    if v == 0:
+        return "none"
+    names = [name for bit, name in _MOTOR_FAULT_BITS if v & bit]
+    extra = v & ~0x7
+    if extra:
+        names.append(f"0x{extra:X}")
+    return " | ".join(names)
 
 # OD tree columns
 _COLUMNS = ["Name", "Index:Sub", "Type", "Acc", "Owner", "Category", "Flags", "Value", "Unit", "Watch"]
@@ -719,8 +731,9 @@ class MainWindow(QMainWindow):
             limrow.addWidget(wdg)
         limrow.addStretch(1)
         fl.addRow("Soft limits (0x2600:6/7):", limrow)
-        # Entry-point groups in display order: position, velocity, current, tuning, feedback.
-        for g in (self.cmd_posg, self.cmd_velg, self.cmd_curg, self.cmd_tuneg, self.cmd_sweepg, self.cmd_fbg):
+        self._build_cmd_diag()   # Diagnostics group (faults + state), ADR-058
+        # Entry-point groups in display order: position, velocity, current, tuning, feedback, diagnostics.
+        for g in (self.cmd_posg, self.cmd_velg, self.cmd_curg, self.cmd_tuneg, self.cmd_sweepg, self.cmd_fbg, self.cmd_diag):
             outer.addWidget(g)
         self._cmd_update_entry_enables()
 
@@ -918,7 +931,9 @@ class MainWindow(QMainWindow):
             return
         key = res["entry"].key
         if key == (0x3000, 0):
-            self.cmd_state_lbl.setText(_AXIS_STATE_NAMES.get(int(res["raw"]), str(res["raw"])))
+            nm = _AXIS_STATE_NAMES.get(int(res["raw"]), str(res["raw"]))
+            self.cmd_state_lbl.setText(nm)
+            if hasattr(self, "diag_c_state"): self.diag_c_state.setText(nm)
         elif key == (0x2300, 6):
             self.cmd_accel_up.setText(f"{res['si']:.6g}")
         elif key == (0x2300, 7):
@@ -931,6 +946,7 @@ class MainWindow(QMainWindow):
             sw = int(res["raw"])
             self.cmd_sw_lbl.setText(self._cmd_sw_decode(sw))
             self.cmd_fb_reached.setText("yes" if (sw & 0x0400) else "no")
+            if hasattr(self, "diag_m_state"): self.diag_m_state.setText(self._cmd_sw_decode(sw))
         elif key == (0x6064, 0):
             self._cmd_last_pos_rad = res['si']
             self.cmd_fb_pos.setText(f"{res['si']:.5g} rad")
@@ -961,6 +977,21 @@ class MainWindow(QMainWindow):
             idx = self.mcfg_backend.findData(be)
             if idx >= 0:
                 self.mcfg_backend.setCurrentIndex(idx)
+        elif key == (0x2700, 9):   # homing status (ADR-057)
+            st = int(res["raw"])
+            self.home_status_lbl.setText(self._HOME_STATUS.get(st, str(st)))
+            if st != 1:            # idle / done / failed -> stop polling
+                self.home_poll_timer.stop()
+        elif key == (0x2600, 1):   # motor active faults (ADR-058)
+            self.diag_m_fault.setText(_decode_motor_faults(int(res["raw"])))
+        elif key == (0x2600, 10):  # motor fault history (sticky since boot)
+            self.diag_m_hist.setText(_decode_motor_faults(int(res["raw"])))
+        elif key == (0x3004, 0):   # CMC error code (ADR-058)
+            self._diag_ec = int(res["raw"]); self._diag_update_cmc_err()
+        elif key == (0x3005, 0):   # CMC error register
+            self._diag_er = int(res["raw"]); self._diag_update_cmc_err()
+        elif key == (0x3014, 0):   # CMC auto-cleared fault count
+            self.diag_c_clr.setText(str(int(res["raw"])))
 
     # --- velocity-pulse generator (GUI-side; drives 0x3023 over time) ---
     def _cmd_tune_mode_changed(self) -> None:
@@ -1093,7 +1124,9 @@ class MainWindow(QMainWindow):
         # PC tool itself; the web UI is the canonical place for network changes.
         groups = [
             ("Joystick calibration (CMC-owned)", [
-                (0x3022, 0),   # axis_joystick_max_velocity (rad/s)
+                # 0x3022 axis_joystick_max_velocity removed in 4.8.0 — it is
+                # now derived from velocity_limit x joy_profile_scale (CAMERAD
+                # JOY_PROFILE_*), no longer independently settable.
                 (0x3027, 0),   # axis_joystick_raw_center
                 (0x3028, 0),   # axis_joystick_raw_full_pos
                 (0x3029, 0),   # axis_joystick_raw_full_neg
@@ -1477,6 +1510,81 @@ class MainWindow(QMainWindow):
         if self.client.connected:
             self._cmd_write((0x2900, 8), 0, "dq_test_enable")
 
+    _HOME_STATUS = {0: "idle", 1: "RUNNING…", 2: "DONE (zeroed)", 3: "FAILED (timeout)"}
+
+    def _home_start(self) -> None:
+        """Start homing to the end stop (write 0x2700:6/7, then command :8=1); polls :9 for status. (ADR-057)"""
+        if not self.client.connected:
+            QMessageBox.warning(self, "Not connected", "Connect to the CMC first.")
+            return
+        if QMessageBox.question(
+                self, "Home to end stop",
+                "This drives the motor into the end stop and sets the encoder zero there, bypassing the CMC.\n\n"
+                "Ensure the path to the stop is clear and the CMC axis_manager is OFF. Continue?"
+            ) != QMessageBox.StandardButton.Yes:
+            return
+        self._cmd_write((0x2700, 6), float(self.home_vel.value()), "home_velocity_rad_s")
+        self._cmd_write((0x2700, 7), float(self.home_cur.value()), "home_current_a")
+        self._cmd_write((0x2700, 8), 1, "home_command")
+        self.home_status_lbl.setText("RUNNING…")
+        self.home_poll_timer.start()
+        self._log(f"homing: {self.home_vel.value():.2f} rad/s until |i| > {self.home_cur.value():.2f} A", "INFO")
+
+    def _home_stop(self) -> None:
+        """Abort homing (home_command → 0)."""
+        if self.client.connected:
+            self._cmd_write((0x2700, 8), 0, "home_command")
+        self.home_poll_timer.stop()
+        self.home_status_lbl.setText("idle")
+
+    def _home_poll(self) -> None:
+        """Poll home_status (0x2700:9) -> _cmd_on_state_read updates the label and stops on done/failed."""
+        if not self.client.connected:
+            self.home_poll_timer.stop(); return
+        entry = self.od.by_key.get((0x2700, 9))
+        if entry is not None and entry.readable:
+            self.client.read_async(entry)
+
+    def _build_cmd_diag(self) -> None:
+        """Diagnostics group: motor + CMC active faults, motor fault history (since boot), operating
+        state. Polled at 1 Hz; reads routed via _cmd_on_state_read. (ADR-058)"""
+        self.cmd_diag = QGroupBox("Diagnostics  (faults & state)")
+        dgl = QFormLayout(self.cmd_diag)
+        self.diag_m_state = QLabel("—"); self.diag_m_state.setStyleSheet("font-weight:bold;")
+        self.diag_m_fault = QLabel("—")
+        self.diag_m_hist  = QLabel("—"); self.diag_m_hist.setStyleSheet("color:#a60;")
+        self.diag_c_state = QLabel("—"); self.diag_c_state.setStyleSheet("font-weight:bold;")
+        self.diag_c_err   = QLabel("—")
+        self.diag_c_clr   = QLabel("—")
+        dgl.addRow("Motor state:", self.diag_m_state)
+        dgl.addRow("Motor active faults:", self.diag_m_fault)
+        dgl.addRow("Motor fault history (since boot):", self.diag_m_hist)
+        dgl.addRow("CMC state:", self.diag_c_state)
+        dgl.addRow("CMC error:", self.diag_c_err)
+        dgl.addRow("CMC auto-cleared faults:", self.diag_c_clr)
+        d_clr = QPushButton("Clear faults")
+        d_clr.setToolTip("Clear latched faults (CMC axis_clear_fault). The since-boot history is unaffected.")
+        d_clr.clicked.connect(self._cmd_clear_fault)
+        dgl.addRow(d_clr)
+        self._diag_ec = 0; self._diag_er = 0
+        self.diag_timer = QTimer(self)
+        self.diag_timer.setInterval(1000)
+        self.diag_timer.timeout.connect(self._diag_poll)
+        self.diag_timer.start()
+
+    def _diag_poll(self) -> None:
+        """Read the diagnostics entries (routed to _cmd_on_state_read). (ADR-058)"""
+        if not self.client.connected:
+            return
+        for key in _DIAG_KEYS:
+            entry = self.od.by_key.get(key)
+            if entry is not None and entry.readable:
+                self.client.read_async(entry)
+
+    def _diag_update_cmc_err(self) -> None:
+        ec = getattr(self, "_diag_ec", 0); er = getattr(self, "_diag_er", 0)
+        self.diag_c_err.setText("none" if (ec == 0 and er == 0) else f"code 0x{ec:04X}  reg 0x{er:02X}")
+
     def _obs_apply_damping(self) -> None:
         """Compute obs_kv = 2·ζ·√(obs_kp) from the entered damping + the last-read obs_kp, write 0x2500:5."""
         kp = self._mcfg_vals.get((0x2500, 3))
@@ -1743,6 +1851,44 @@ class MainWindow(QMainWindow):
         note.setWordWrap(True); note.setStyleSheet("color: #888;")
         pgl.addRow(note)
         col.addWidget(pg)
+
+        # Homing / zeroing to a hard end stop (ADR-057) -- for incremental (quad) encoders.
+        hg = QGroupBox("Home to end stop  (incremental encoder zeroing)")
+        self._home_group = hg
+        hgl = QFormLayout(hg)
+        self.home_vel = QDoubleSpinBox()
+        self.home_vel.setRange(-50.0, 50.0); self.home_vel.setSingleStep(0.5)
+        self.home_vel.setDecimals(2); self.home_vel.setValue(-1.0); self.home_vel.setSuffix(" rad/s")
+        self.home_vel.setToolTip("Approach velocity toward the end stop; sign = direction (usually negative). "
+                                 "Keep it slow for a gentle stall and a clean current rise.")
+        hgl.addRow("approach velocity:", self.home_vel)
+        self.home_cur = QDoubleSpinBox()
+        self.home_cur.setRange(0.0, 50.0); self.home_cur.setSingleStep(0.5)
+        self.home_cur.setDecimals(2); self.home_cur.setValue(2.0); self.home_cur.setSuffix(" A")
+        self.home_cur.setToolTip("Stall-detect current: when |armature current| exceeds this for ~300 ms the end "
+                                 "stop is found. Set it BELOW the velocity current limit (0x2300:4) so it can trip.")
+        hgl.addRow("stall current:", self.home_cur)
+        hrow = QHBoxLayout()
+        self.home_run = QPushButton("Home")
+        self.home_run.setToolTip("Drive toward the end stop; on stall, set the encoder zero there. Bypasses the "
+                                 "CMC (set axis_manager OFF). 30 s timeout if the current never trips.")
+        self.home_run.clicked.connect(self._home_start)
+        self.home_stop = QPushButton("Stop")
+        self.home_stop.setToolTip("Abort homing now (home_command → 0).")
+        self.home_stop.clicked.connect(self._home_stop)
+        self.home_status_lbl = QLabel("idle")
+        self.home_status_lbl.setStyleSheet("font-weight: bold;")
+        hrow.addWidget(self.home_run); hrow.addWidget(self.home_stop)
+        hrow.addWidget(QLabel("status:")); hrow.addWidget(self.home_status_lbl); hrow.addStretch(1)
+        hgl.addRow(hrow)
+        hnote = QLabel("Drives to a hard stop and sets that position as the encoder zero. Set the quad scale "
+                       "(0x2500:8) and a sane velocity current limit (0x2300:4) first. Path must be clear.")
+        hnote.setWordWrap(True); hnote.setStyleSheet("color: #888;")
+        hgl.addRow(hnote)
+        col.addWidget(hg)
+        self.home_poll_timer = QTimer(self)
+        self.home_poll_timer.setInterval(400)
+        self.home_poll_timer.timeout.connect(self._home_poll)
 
         # Live current-loop readouts. Measured current streams via the telemetry map (no polling); the
         # derived gains are read once on connect + ~100 ms after an R/L/bandwidth edit.
@@ -2519,6 +2665,8 @@ class MainWindow(QMainWindow):
             lbl = row.get("label")
             if lbl is not None:
                 lbl.setToolTip(why)
+        if hasattr(self, "_home_group"):   # homing is for incremental encoders (brushed today) (ADR-057)
+            self._home_group.setEnabled(be == 1)
 
     def _mcfg_read_all(self) -> None:
         if not self.client.connected:
@@ -2898,7 +3046,7 @@ class MainWindow(QMainWindow):
                 self._mcfg_status[entry.key].setText(f"<{res.get('error', 'error')}>")
         # Motor Command tab: route axis/motor state read-backs to the command labels.
         if (entry.key in _CMD_STATE_KEYS or entry.key in _MCFG_READOUT_KEYS
-                or entry.key in _CMD_READOUT_KEYS) and res.get("ok"):
+                or entry.key in _CMD_READOUT_KEYS or entry.key in _DIAG_KEYS) and res.get("ok"):
             self._cmd_on_state_read(res)
         # Motor Config tab: route LED-colour read-backs (0x3060/61/62) into the
         # sliders so "Read LED" pulls the live values from the CMC.

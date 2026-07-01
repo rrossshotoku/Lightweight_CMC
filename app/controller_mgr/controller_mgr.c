@@ -27,6 +27,7 @@
 
 #include "controller_mgr.h"
 
+#include "app/axis_manager/axis_manager.h"   /* JOY_PROFILE keypresses -> axis_manager_set_joy_profile */
 #include "app/camerad/camerad.h"
 #include "app/cmc_state/cmc_state.h"
 #include "app/config/config.h"
@@ -592,13 +593,18 @@ static void handle_keypress_t1(const camerad_header_t *req,
 
     case CAMERAD_KC_JOY_PROFILE_NORMAL:
     case CAMERAD_KC_JOY_PROFILE_MEDIUM:
-    case CAMERAD_KC_JOY_PROFILE_FINE:
-        /* Joystick profile — not yet wired into axis_manager.
-         * For now, accept and ack. Phase later: map to a joystick
-         * acceleration/scaling profile in axis_manager. */
-        LOG_INFO("ctrl_mgr: joystick profile request 0x%02X (not yet wired)",
-                 (unsigned)kp.key_code);
+    case CAMERAD_KC_JOY_PROFILE_FINE: {
+        /* Map CAMERAD's three-way selector onto axis_manager's joy_profile.
+         * axis_manager scales joystick_max_velocity = velocity_limit ×
+         * (1.0 | 0.5 | 0.15) so the operator's full-stick output shrinks
+         * with the profile — CAMERAD's fine/medium/normal without the
+         * motor MCU needing to know anything about profiles. */
+        uint8_t p =
+            (kp.key_code == CAMERAD_KC_JOY_PROFILE_FINE)   ? 2u :
+            (kp.key_code == CAMERAD_KC_JOY_PROFILE_MEDIUM) ? 1u : 0u;
+        (void)axis_manager_set_joy_profile(p);
         break;
+    }
 
     default:
         LOG_INFO("ctrl_mgr: KEYPRESS_T1 unhandled key 0x%02X (ignored, will still ack)",

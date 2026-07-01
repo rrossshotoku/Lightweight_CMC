@@ -119,7 +119,13 @@ typedef struct {
     /* Mode + per-mode targets (commanded by protocol modules) */
     axis_op_mode_t   op_mode_commanded;
     float            joystick_value;         /* -1.0 .. +1.0 (normalised) */
-    float            joystick_max_velocity;  /* rad/s at full deflection (symmetric) */
+    /* joystick_max_velocity is DERIVED, not operator-settable — it tracks
+     * velocity_limit_rad_s (motion limit, 0x3030) scaled by the currently-
+     * selected joystick speed profile (NORMAL / MEDIUM / FINE).
+     * Recomputed by recompute_joystick_max_velocity() whenever either
+     * input changes. 0x3022 is exposed RO in the OD for observation. */
+    float            joystick_max_velocity;
+    uint8_t          joy_profile;            /* AXIS_JOY_PROFILE_* — CAMERAD JOY_PROFILE_* selects */
     float            target_velocity_rad_s;
     float            target_position_rad;
     float            target_time_s;
@@ -249,6 +255,34 @@ static uint32_t to_scaled_u32(float si, float scale)
     return (uint32_t)(raw_f + 0.5f);
 }
 
+/* Joystick speed profiles — CAMERAD JOY_PROFILE_* keypresses cycle
+ * through these to give the operator a hardware coarse/fine control
+ * over stick sensitivity. Scale factor multiplies the motion limit
+ * (velocity_limit, 0x3030) to produce the effective joystick_max_velocity.
+ * NORMAL = 1.0 means full-stick reaches the configured motion ceiling. */
+#define AXIS_JOY_PROFILE_NORMAL   (0u)   /* 1.0x  — full stick reaches velocity_limit */
+#define AXIS_JOY_PROFILE_MEDIUM   (1u)   /* 0.5x  — half speed for medium-sensitivity work */
+#define AXIS_JOY_PROFILE_FINE     (2u)   /* 0.15x — precise framing */
+
+static float joy_profile_scale(uint8_t p)
+{
+    switch (p) {
+    case AXIS_JOY_PROFILE_MEDIUM: return 0.5f;
+    case AXIS_JOY_PROFILE_FINE:   return 0.15f;
+    case AXIS_JOY_PROFILE_NORMAL:
+    default:                      return 1.0f;
+    }
+}
+
+/* Derive joystick_max_velocity from the current motion limit and profile.
+ * Called whenever either input changes (velocity_limit setter, profile
+ * setter, or persist-load). */
+static void recompute_joystick_max_velocity(void)
+{
+    s_axis.joystick_max_velocity =
+        s_axis.velocity_limit_rad_s * joy_profile_scale(s_axis.joy_profile);
+}
+
 /* Apply the joystick calibration to the current raw value, write the
  * result into joystick_value. Linear with deadband, symmetric output
  * cap (joystick_max_velocity for both directions). Called when the raw
@@ -339,7 +373,13 @@ typedef struct __attribute__((packed)) {
 
 static void apply_persist_blob(const axis_persist_blob_t *b)
 {
-    s_axis.joystick_max_velocity = b->joystick_max_velocity;
+    /* joystick_max_velocity in the persist blob is legacy — the v4 layout
+     * carried it as an operator-settable field. As of 4.8.0 it's derived
+     * from velocity_limit × profile_scale (see recompute_joystick_max_velocity),
+     * so we IGNORE b->joystick_max_velocity on load and recompute after the
+     * limit + profile have been applied. The persist blob layout is kept
+     * unchanged so the calibration + motion limits + LED colour survive
+     * the upgrade — see the 4.8.0 CHANGELOG entry for the migration note. */
     s_axis.joystick_raw_center   = b->joystick_raw_center;
     s_axis.joystick_raw_full_pos = b->joystick_raw_full_pos;
     s_axis.joystick_raw_full_neg = b->joystick_raw_full_neg;
@@ -349,10 +389,14 @@ static void apply_persist_blob(const axis_persist_blob_t *b)
     s_axis.position_limit_hi_rad = b->position_limit_hi_rad;
     s_axis.accel_limit_rad_s2    = b->accel_limit_rad_s2;
     led_indicator_apply_persist(b->led_rgb);
+    recompute_joystick_max_velocity();
 }
 
 static void capture_persist_blob(axis_persist_blob_t *b)
 {
+    /* Write the current derived value into the legacy slot so a v4 reader
+     * still gets something meaningful (backwards compat during a rollback).
+     * Load path ignores it anyway (see apply_persist_blob above). */
     b->joystick_max_velocity = s_axis.joystick_max_velocity;
     b->joystick_raw_center   = s_axis.joystick_raw_center;
     b->joystick_raw_full_pos = s_axis.joystick_raw_full_pos;
@@ -392,8 +436,9 @@ void axis_manager_init(void)
     s_axis.op_mode_actual    = AXIS_OP_MODE_OFF;
     s_axis.op_mode_commanded = AXIS_OP_MODE_OFF;
 
-    s_axis.joystick_max_velocity  = 1.0f;
+    s_axis.joy_profile            = AXIS_JOY_PROFILE_NORMAL;  /* boot to full-speed; not persisted */
     s_axis.velocity_limit_rad_s   = 10.0f;
+    recompute_joystick_max_velocity();   /* derived — needs velocity_limit + profile set first */
     s_axis.position_limit_lo_rad  = -INFINITY;
     s_axis.position_limit_hi_rad  = +INFINITY;
     s_axis.accel_limit_rad_s2     = 100.0f;
@@ -766,6 +811,7 @@ static void poll_load_factor_sdo(void);
 static void poll_motor_proxy_sdo(void);
 static void tick_motor_save(void);
 static void tick_proxy_bootsync(void);
+static void tick_home_sequencer(void);
 static bool proxy_motor_f32_begin(uint32_t slot_idx, float v);
 
 /* Proxy slot indices — keep in sync with the s_proxy_slots[] table further
@@ -1019,6 +1065,7 @@ void axis_manager_tick(void)
     tick_proxy_bootsync();   /* reads first (no-op once complete) */
     poll_motor_proxy_sdo();  /* writes second (round-robin across dirty slots) */
     tick_motor_save();
+    tick_home_sequencer();   /* home-to-endstop procedure + is_homed cache */
 
     /* 3. Sample the on-board UP/DOWN buttons. In TORQUE mode this drives
      * target_current_a; the next step (sequencer) will pick up the new
@@ -1141,10 +1188,24 @@ bool  axis_manager_set_joystick_value(float v)
 }
 
 float axis_manager_get_joystick_max_velocity(void) { return s_axis.joystick_max_velocity; }
-bool  axis_manager_set_joystick_max_velocity(float v)
+/* Removed in 4.8.0 — joystick_max_velocity is now derived from
+ * (velocity_limit × joy_profile_scale). 0x3022 is RO in the OD; writes
+ * return ACCESS-denied. See axis_manager_set_joy_profile below. */
+
+uint8_t axis_manager_get_joy_profile(void) { return s_axis.joy_profile; }
+bool    axis_manager_set_joy_profile(uint8_t p)
 {
-    if (v < 0.0f || isnan(v)) return false;
-    s_axis.joystick_max_velocity = v;
+    if (p != AXIS_JOY_PROFILE_NORMAL &&
+        p != AXIS_JOY_PROFILE_MEDIUM &&
+        p != AXIS_JOY_PROFILE_FINE) {
+        return false;
+    }
+    if (s_axis.joy_profile != p) {
+        LOG_INFO("axis_manager: joy_profile %u -> %u (scale %.2f) — joystick_max_velocity = velocity_limit * scale",
+                 (unsigned)s_axis.joy_profile, (unsigned)p, (double)joy_profile_scale(p));
+    }
+    s_axis.joy_profile = p;
+    recompute_joystick_max_velocity();
     return true;
 }
 
@@ -1219,6 +1280,10 @@ bool  axis_manager_set_velocity_limit(float v)
 {
     if (v < 0.0f || isnan(v)) return false;
     s_axis.velocity_limit_rad_s = v;
+    /* joystick_max_velocity tracks (velocity_limit × joy_profile_scale) —
+     * update it now so the CAMERAD JOYSTICK-mode demand cap moves with
+     * whatever the operator just set. */
+    recompute_joystick_max_velocity();
     /* Motor enforces its own envelope at 0x2600:4. 0 = disabled per motor
      * CHANGELOG [4.5.0]; we forward the operator's value as-is (0 from
      * the operator just disables motor-side enforcement, CMC-side
@@ -1546,7 +1611,8 @@ static void tick_proxy_bootsync(void)
                 case PROXY_SLOT_VEL_ACCEL_UP:   s_axis.vel_accel_up_rad_s2   = v; break;
                 case PROXY_SLOT_VEL_ACCEL_DN:   s_axis.vel_accel_dn_rad_s2   = v; break;
                 case PROXY_SLOT_VEL_ACCEL_JERK: s_axis.vel_accel_jerk_rad_s3 = v; break;
-                case PROXY_SLOT_VEL_LIMIT:      s_axis.velocity_limit_rad_s  = v; break;
+                case PROXY_SLOT_VEL_LIMIT:      s_axis.velocity_limit_rad_s  = v;
+                                                recompute_joystick_max_velocity(); break;
                 case PROXY_SLOT_ACCEL_LIMIT:    s_axis.accel_limit_rad_s2    = v; break;
                 /* Motor's 0 means "disabled" — translate back to CMC's +/-INF
                  * convention so the CMC-side clamping in compute_desired
@@ -1722,6 +1788,226 @@ static void tick_motor_save(void)
     }
     default:
         s_motor_save_state = MOTOR_SAVE_IDLE;
+        break;
+    }
+}
+
+/*----------------------------------------------------------------------------
+ * Home-to-endstop sequencer + is_homed cache
+ *
+ * Backs the CMC-owned surface at 0x3040/1/2 (write axis_home_command=1 to
+ * start; read axis_home_status for the live motor state; read axis_is_homed
+ * for the "shot recalls allowed" gate). Wraps the motor's own homing at
+ * 0x2700:8/9 and the NOT_HOMED bit in 0x2600:1 fault_flags.
+ *
+ * Two independent state machines share this module:
+ *   1. Boot-and-periodic is_homed refresh
+ *        On the first tick after startup we kick a one-shot SDO read of
+ *        fault_flags so cmc_state has a fresh answer before any recall
+ *        attempt. After that, we lean on the manual re-read that happens
+ *        at the end of a home sequence — refreshing every N seconds like
+ *        bootsync would be overkill (NOT_HOMED only clears via a successful
+ *        home procedure or a factory reset, both of which we already know
+ *        about locally).
+ *   2. Home sequence — states:
+ *        IDLE           nothing in progress
+ *        WRITING_CMD    SDO write of 0x2700:8=1 in flight to motor
+ *        POLLING_STATUS periodic SDO reads of 0x2700:9 waiting for
+ *                       DONE / FAILED. re-issued every HOME_POLL_PERIOD_MS.
+ *        READING_FAULT  after DONE, SDO-read 0x2600:1 to refresh is_homed
+ *        DONE / FAILED  terminal for one wall-clock tick, then IDLE.
+ *
+ * Interaction with other sequencers: cia402's OD pipeline serialises one
+ * SDO at a time. Each state machine here checks its own handle; if
+ * cia402_od_*_begin returns INVALID (pipeline busy with bootsync / motor
+ * save / proxy write) we just retry next tick. Total home wall-clock is
+ * bounded by the motor-side operation (drive-to-stall, typically 1–10 s
+ * per ADR-057) plus a few round-trip SDOs on either end.
+ *---------------------------------------------------------------------------*/
+#define HOME_POLL_PERIOD_MS      200u    /* re-poll home_status every N ms while RUNNING */
+#define HOME_OVERALL_TIMEOUT_MS  30000u  /* absolute cap — motor's own homing is <10s typical */
+
+typedef enum {
+    HOME_SEQ_IDLE = 0,
+    HOME_SEQ_WRITING_CMD,      /* SDO write 0x2700:8 = 1 in flight */
+    HOME_SEQ_POLLING_STATUS,   /* periodic reads of 0x2700:9 */
+    HOME_SEQ_READING_FAULT,    /* post-DONE re-read of 0x2600:1 */
+    HOME_SEQ_TERMINAL_DONE,    /* one tick of "done" for logging */
+    HOME_SEQ_TERMINAL_FAILED,
+} home_seq_state_t;
+
+static home_seq_state_t   s_home_seq_state       = HOME_SEQ_IDLE;
+static cia402_od_handle_t s_home_seq_handle      = CIA402_OD_HANDLE_INVALID;
+static uint32_t           s_home_seq_start_ms    = 0;    /* wall-clock start of the current sequence */
+static uint32_t           s_home_last_poll_ms    = 0;    /* last time we kicked a status read */
+static uint8_t            s_home_last_motor_status = 0;  /* mirror of motor 0x2700:9 (MC_IF_HOME_*) */
+static bool               s_is_homed             = false; /* fault_flags & NOT_HOMED == 0 */
+static bool               s_is_homed_known       = false; /* have we ever successfully read fault_flags? */
+static bool               s_boot_fault_read_kicked = false; /* one-shot at first tick */
+
+uint8_t axis_manager_get_home_status(void)
+{
+    /* Report the motor's own status enum. While IDLE we return whatever the
+     * last poll saw (either IDLE if we never ran, or DONE/FAILED from the
+     * previous run kept as a "sticky" reading). The sequencer state machine
+     * runs independently; this is just the last-known motor value. */
+    return s_home_last_motor_status;
+}
+
+bool axis_manager_is_homed(void)
+{
+    /* Conservative default: if we haven't successfully read fault_flags
+     * yet, treat as NOT homed. Prevents a race at boot where a shot recall
+     * arrives before the first SDO landed. */
+    return s_is_homed_known && s_is_homed;
+}
+
+bool axis_manager_request_home(void)
+{
+    if (s_home_seq_state != HOME_SEQ_IDLE) {
+        LOG_WARN("axis: home busy (%d)", (int)s_home_seq_state);
+        return false;
+    }
+    LOG_INFO("axis: HOME start");
+    s_home_seq_state    = HOME_SEQ_WRITING_CMD;
+    s_home_seq_start_ms = time_ms();
+    s_home_last_poll_ms = 0;
+    return true;
+}
+
+static void tick_home_sequencer(void)
+{
+    /* --- One-shot fault_flags read at first tick after boot ---
+     * We need is_homed populated before cmc_state gates its first
+     * recall. Kicked once; a repeat happens after every home sequence.
+     * Doesn't block anything — if cia402 is busy we just skip and the
+     * next tick will retry via the same not-yet-set flag. */
+    if (!s_boot_fault_read_kicked) {
+        uint8_t dummy = 0;
+        cia402_od_handle_t h = cia402_od_read_begin(0x2600u, 1u, MC_IF_T_U32);
+        (void)dummy;
+        if (h != CIA402_OD_HANDLE_INVALID) {
+            s_home_seq_handle = h;
+            /* Piggyback on the READING_FAULT state to consume the reply
+             * — but only if the main sequence isn't running. */
+            if (s_home_seq_state == HOME_SEQ_IDLE) {
+                s_home_seq_state = HOME_SEQ_READING_FAULT;
+            }
+            s_boot_fault_read_kicked = true;
+        }
+        /* If cia402 was busy we'll retry next tick. */
+    }
+
+    /* --- Sequencer body --- */
+    if (s_home_seq_state == HOME_SEQ_IDLE) return;
+
+    /* Absolute timeout — motor should finish or fail within 30 s. */
+    if (s_home_seq_state != HOME_SEQ_READING_FAULT
+        && time_elapsed_ms(s_home_seq_start_ms) > HOME_OVERALL_TIMEOUT_MS) {
+        LOG_ERROR("axis: HOME timeout (%d)", (int)s_home_seq_state);
+        s_home_seq_state = HOME_SEQ_TERMINAL_FAILED;
+        s_home_last_motor_status = MC_IF_HOME_FAILED;
+        return;
+    }
+
+    switch (s_home_seq_state) {
+    case HOME_SEQ_WRITING_CMD: {
+        if (s_home_seq_handle == CIA402_OD_HANDLE_INVALID) {
+            /* Try to issue the write. If cia402 is busy we retry next tick. */
+            uint8_t one = 1u;
+            s_home_seq_handle = cia402_od_write_begin(
+                0x2700u, 8u, MC_IF_T_U8, &one, sizeof(one));
+            if (s_home_seq_handle == CIA402_OD_HANDLE_INVALID) return;
+        }
+        /* Wait for reply. */
+        MC_IfOdResult_t res = MC_IF_OD_OK;
+        uint8_t buf[8] = {0};
+        uint8_t vlen   = sizeof(buf);
+        if (!cia402_od_poll(s_home_seq_handle, &res, buf, &vlen)) return;
+        s_home_seq_handle = CIA402_OD_HANDLE_INVALID;
+        if (res != MC_IF_OD_OK) {
+            LOG_ERROR("axis: HOME wr fail %d", (int)res);
+            s_home_seq_state = HOME_SEQ_TERMINAL_FAILED;
+            s_home_last_motor_status = MC_IF_HOME_FAILED;
+            return;
+        }
+        s_home_seq_state    = HOME_SEQ_POLLING_STATUS;
+        s_home_last_poll_ms = time_ms();
+        break;
+    }
+    case HOME_SEQ_POLLING_STATUS: {
+        /* No poll in flight — start a fresh one either right away
+         * (first entry) or after HOME_POLL_PERIOD_MS has elapsed. */
+        if (s_home_seq_handle == CIA402_OD_HANDLE_INVALID) {
+            if (time_elapsed_ms(s_home_last_poll_ms) < HOME_POLL_PERIOD_MS
+                && time_elapsed_ms(s_home_seq_start_ms) > 100u) {
+                return;   /* rate-limit — motor won't have changed yet */
+            }
+            s_home_seq_handle = cia402_od_read_begin(0x2700u, 9u, MC_IF_T_U8);
+            if (s_home_seq_handle == CIA402_OD_HANDLE_INVALID) return;
+            s_home_last_poll_ms = time_ms();
+        }
+        MC_IfOdResult_t res = MC_IF_OD_OK;
+        uint8_t buf[8] = {0};
+        uint8_t vlen   = sizeof(buf);
+        if (!cia402_od_poll(s_home_seq_handle, &res, buf, &vlen)) return;
+        s_home_seq_handle = CIA402_OD_HANDLE_INVALID;
+        if (res != MC_IF_OD_OK || vlen == 0) {
+            return;   /* stay in POLLING_STATUS, will retry after period */
+        }
+        uint8_t status = buf[0];
+        if (status != s_home_last_motor_status) {
+            LOG_INFO("axis: HOME st %u->%u",
+                     (unsigned)s_home_last_motor_status, (unsigned)status);
+            s_home_last_motor_status = status;
+        }
+        if (status == MC_IF_HOME_DONE || status == MC_IF_HOME_FAILED) {
+            /* Re-read fault_flags so is_homed reflects the current
+             * (still-set on FAILED) NOT_HOMED bit. */
+            s_home_seq_state = HOME_SEQ_READING_FAULT;
+        }
+        /* else RUNNING / IDLE — keep polling. */
+        break;
+    }
+    case HOME_SEQ_READING_FAULT: {
+        if (s_home_seq_handle == CIA402_OD_HANDLE_INVALID) {
+            s_home_seq_handle = cia402_od_read_begin(0x2600u, 1u, MC_IF_T_U32);
+            if (s_home_seq_handle == CIA402_OD_HANDLE_INVALID) return;
+        }
+        MC_IfOdResult_t res = MC_IF_OD_OK;
+        uint8_t buf[8] = {0};
+        uint8_t vlen   = sizeof(buf);
+        if (!cia402_od_poll(s_home_seq_handle, &res, buf, &vlen)) return;
+        s_home_seq_handle = CIA402_OD_HANDLE_INVALID;
+        if (res == MC_IF_OD_OK && vlen >= sizeof(uint32_t)) {
+            uint32_t ff;
+            memcpy(&ff, buf, sizeof(ff));
+            bool was_homed = s_is_homed;
+            s_is_homed = (ff & MC_IF_FAULT_NOT_HOMED) == 0u;
+            s_is_homed_known = true;
+            if (was_homed != s_is_homed || !was_homed) {
+                LOG_INFO("axis: is_homed=%d ff=0x%lx", (int)s_is_homed, (unsigned long)ff);
+            }
+            /* Boot one-shot goes straight to IDLE; sequence terminals log. */
+            if (s_home_last_motor_status == MC_IF_HOME_DONE) {
+                s_home_seq_state = HOME_SEQ_TERMINAL_DONE;
+            } else if (s_home_last_motor_status == MC_IF_HOME_FAILED) {
+                s_home_seq_state = HOME_SEQ_TERMINAL_FAILED;
+            } else {
+                s_home_seq_state = HOME_SEQ_IDLE;
+            }
+        } else {
+            s_home_seq_state = HOME_SEQ_IDLE;
+        }
+        break;
+    }
+    case HOME_SEQ_TERMINAL_DONE:
+    case HOME_SEQ_TERMINAL_FAILED:
+        LOG_INFO("axis: HOME end (is_homed=%d)", (int)s_is_homed);
+        s_home_seq_state = HOME_SEQ_IDLE;
+        break;
+    default:
+        s_home_seq_state = HOME_SEQ_IDLE;
         break;
     }
 }

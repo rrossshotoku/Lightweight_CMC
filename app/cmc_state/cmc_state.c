@@ -351,6 +351,17 @@ bool cmc_state_move_to_shot(uint32_t shot_no, bool is_cut)
         LOG_WARN("cmc_state: move_to_shot %lu — slot empty", (unsigned long)shot_no);
         return false;
     }
+    /* Gate shot recalls on the motor's homed state (CHANGELOG 4.9.0).
+     * position_actual on an un-homed incremental encoder is meaningless as
+     * an absolute reference, so recalling a stored position could send the
+     * rig anywhere. Operator must run the home-to-endstop procedure via
+     * axis_manager (OD 0x3040 = 1) first. axis_manager_is_homed() reports
+     * false conservatively until fault_flags has been successfully read
+     * at least once — protects the very first recall attempt at boot. */
+    if (!axis_manager_is_homed()) {
+        LOG_WARN("cmc_state: shot %lu rejected: not homed", (unsigned long)shot_no);
+        return false;
+    }
 
     float target = s_shots[idx].position_rad;
 
